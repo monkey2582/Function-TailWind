@@ -15,8 +15,8 @@ interface Ftw {
   resume(): void;
   update(target?: string | Element | NodeList | Array<Element>): void;
   once(): void;
-  skip(...selectors: (string | Element)[]): void;
-  unskip(...selectors: (string | Element)[]): void;
+  ignore(...selectors: (string | Element)[]): void;
+  unignore(...selectors: (string | Element)[]): void;
 }
 declare global {
   var ftw: Ftw;
