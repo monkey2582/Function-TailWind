@@ -156,7 +156,7 @@
      * @param {Element} element - 要处理的元素
      */
     function processElement(element) {
-        if (!element.classList || !element.classList.length || element?.closest("[ftw-skip]")) return;
+        if (!element.classList || !element.classList.length || element?.closest("[ftw-ignore]")) return;
 
         // 检查是否包含任何可能为工具类的类名（快速筛选）
         let hasPotential = false;
@@ -883,34 +883,15 @@
     /**
      * 调度一次更新（遍历所有元素处理新类）。
      */
-    function scheduleUpdate() {
-        if (updateScheduled) return;
-        updateScheduled = true;
-        requestIdleCallback(() => {
-            processedElements = new WeakSet();
-            const allElements = document.querySelectorAll('*');
-            let index = 0;
-            requestIdleCallback(function processNext(deadline) {
-                while (index < allElements.length && (deadline.timeRemaining() > 1 || deadline.didTimeout)) {
-                    processElement(allElements[index]);
-                    index++;
-                }
-                if (index < allElements.length) {
-                    requestIdleCallback(processNext, { timeout: 300 });
-                } else {
-                    updateScheduled = false;
-                }
-            }, { timeout: 300 });
-        });
-    }
+function scheduleUpdate() {
+    if (isProcessingPaused) return;
 
-    /**
-     * 执行完整的 DOM 扫描（用于初始化或手动更新）。
-     */
-    function scanAllElements() {
+    if (updateScheduled) return;
+    updateScheduled = true;
+    requestIdleCallback(() => {
+        processedElements = new WeakSet();
         const allElements = document.querySelectorAll('*');
         let index = 0;
-        processedElements = new WeakSet();
         requestIdleCallback(function processNext(deadline) {
             while (index < allElements.length && (deadline.timeRemaining() > 1 || deadline.didTimeout)) {
                 processElement(allElements[index]);
@@ -918,10 +899,34 @@
             }
             if (index < allElements.length) {
                 requestIdleCallback(processNext, { timeout: 300 });
+            } else {
+                updateScheduled = false;
             }
         }, { timeout: 300 });
-    }
+    });
+}
+    /**
+     * 执行完整的 DOM 扫描（用于初始化或手动更新）。
+     */
+function scanAllElements(force) {
+    // 重置处理记录（无论是否暂停都需要重置，保证状态干净）
+    processedElements = new WeakSet();
 
+    // 如果不是强制模式，且暂停了，则返回
+    if (!force && isProcessingPaused) return;
+
+    const allElements = document.querySelectorAll('*');
+    let index = 0;
+    requestIdleCallback(function processNext(deadline) {
+        while (index < allElements.length && (deadline.timeRemaining() > 1 || deadline.didTimeout)) {
+            processElement(allElements[index]);
+            index++;
+        }
+        if (index < allElements.length) {
+            requestIdleCallback(processNext, { timeout: 300 });
+        }
+    }, { timeout: 300 });
+}
     // ========================================================================
     // 公开 API
     // ========================================================================
@@ -1037,12 +1042,7 @@
      */
     ftw.update = function(target) {
         if (arguments.length === 0) {
-            // 全量更新
-            const all = document.querySelectorAll('*');
-            for (let i = 0; i < all.length; i++) {
-                processElement(all[i]);
-            }
-            return;
+            scanAllElements(false) // 全量更新，受暂停控制
         }
         if (typeof target === 'string') {
             const elements = document.querySelectorAll(target);
@@ -1078,45 +1078,45 @@
      * 执行一次全量更新并暂停自动处理（用于一次性初始化）。
      */
     ftw.once = function() {
-        ftw.update();
+        scanAllElements(false);
         ftw.pause();
     };
 /**
- * 为元素添加 `ftw-skip` 属性，使其及其子树被动态样式系统忽略。
+ * 为元素添加 `ftw-ignore` 属性，使其及其子树被动态样式系统忽略。
  * 支持传入多个参数，每个参数可以是选择器字符串或 DOM 元素。
  *
  * @param {...(string|Element)} selectors - 要跳过的元素选择器或 DOM 元素
  * @example
- * ftw.skip('#ad', document.querySelector('.banner'));
+ * ftw.ignore('#ad', document.querySelector('.banner'));
  */
-ftw.skip = function(...selectors) {
+ftw.ignore = function(...selectors) {
   for (let arg of selectors) {
     if (typeof arg === 'string') {
-      document.querySelectorAll(arg).forEach(el => el.setAttribute('ftw-skip', ''));
+      document.querySelectorAll(arg).forEach(el => el.setAttribute('ftw-ignore', ''));
     } else if (arg && arg.nodeType === 1) {
-      arg.setAttribute('ftw-skip', '');
+      arg.setAttribute('ftw-ignore', '');
     }
   }
 };
 
 /**
- * 移除元素上的 `ftw-skip` 属性，使其恢复动态样式监听。
+ * 移除元素上的 `ftw-ignore` 属性，使其恢复动态样式监听。
  * 支持传入多个参数，每个参数可以是选择器字符串或 DOM 元素。
  * 移除属性后会立即调用 `ftw.update` 重新扫描这些元素。
  *
  * @param {...(string|Element)} selectors - 要取消跳过的元素选择器或 DOM 元素
  * @example
- * ftw.unskip('.ad-container', document.getElementById('popup'));
+ * ftw.unignore('.ad-container', document.getElementById('popup'));
  */
-ftw.unskip = function(...selectors) {
+ftw.unignore = function(...selectors) {
   for (let arg of selectors) {
     if (typeof arg === 'string') {
       document.querySelectorAll(arg).forEach(el => {
-        el.removeAttribute('ftw-skip');
+        el.removeAttribute('ftw-ignore');
         ftw.update(el);
       });
     } else if (arg && arg.nodeType === 1) {
-      arg.removeAttribute('ftw-skip');
+      arg.removeAttribute('ftw-ignore');
       ftw.update(arg);
     }
   }
@@ -1266,28 +1266,27 @@ ftw.unskip = function(...selectors) {
     /**
      * 初始化：注入重置样式，启动观察器，加载已有的 ftw-utils 和 ftw-render。
      */
-    function init() {
-        injectResetStyles();
+function init() {
+    injectResetStyles();
 
-        // 处理已有的 ftw-utils 脚本
-        document.querySelectorAll('script[ftw-utils]').forEach(script => loadUtils(script));
+    document.querySelectorAll('script[ftw-utils]').forEach(script => loadUtils(script));
+    document.querySelectorAll('style[ftw-render], link[ftw-render][rel="stylesheet"]').forEach(style => renderStyleNode(style));
 
-        // 处理已有的 ftw-render 样式
-        document.querySelectorAll('style[ftw-render], link[ftw-render][rel="stylesheet"]').forEach(style => renderStyleNode(style));
-
-        // 扫描所有元素，处理已有类名
-        scanAllElements();
-
-        // 启动 MutationObserver
-        startObserver();
+    // 如果未暂停则执行扫描（force=false），否则跳过
+    if (!isProcessingPaused) {
+        scanAllElements(false);  // 正常模式，受暂停控制
     }
 
+    startObserver();
+}
     // 根据页面加载状态执行初始化
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
-    }
+    document.addEventListener('DOMContentLoaded', function() {
+        setTimeout(init, 0);
+    });
+} else {
+    setTimeout(init, 0);
+}
 
     // ========================================================================
     // 暴露全局

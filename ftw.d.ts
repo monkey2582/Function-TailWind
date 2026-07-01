@@ -1,15 +1,24 @@
-export as namespace ftw;
-export = ftw;
+/**
+ * ftw 压缩版的 TypeScript 类型声明
+ * 全局命名空间（通过 <script> 标签加载）
+ */
 
-declare const ftw: {
-  util: {
-    (defs: Record<string, string | ((...args: (string|number)[]) => string) | [string|((...args: (string|number)[]) => string), string[]]>): void;
-    (name: string, gen: string | ((...args: (string|number)[]) => string), args?: string[]): void;
-  };
-  render: (target: string | Element) => void;
-  use: (target: string | Element) => void;
-};
-
-declare global {
-  interface Window { ftw: typeof ftw; }
+interface FtwUtilsConfig {
+  [prefix: string]: string | Function | [generator: Function | string, numIdx?: number[], paramMap?: Record<string, number>];
 }
+type FtwGenerator = (...args: (string | number)[]) => string;
+interface Ftw {
+  util(keyOrConfig: string | FtwUtilsConfig, value?: string | FtwGenerator | [FtwGenerator | string, number[], Record<string, number>], numIdx?: number[]): void;
+  render(selector: string | Element): void;
+  use(input: string | Element): void;
+  pause(): void;
+  resume(): void;
+  update(target?: string | Element | NodeList | Array<Element>): void;
+  once(): void;
+  skip(...selectors: (string | Element)[]): void;
+  unskip(...selectors: (string | Element)[]): void;
+}
+declare global {
+  var ftw: Ftw;
+}
+export {};
