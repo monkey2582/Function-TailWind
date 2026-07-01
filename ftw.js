@@ -1077,9 +1077,9 @@ function scanAllElements(force) {
     /**
      * 执行一次全量更新并暂停自动处理（用于一次性初始化）。
      */
-    ftw.once = function() {
+    ftw.once = function(target) {
         ftw.resume();
-        scanAllElements(false);
+        ftw.update(target); // 更新一次然后暂停
         ftw.pause();
     };
 /**

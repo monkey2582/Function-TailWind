@@ -13,8 +13,8 @@ interface Ftw {
   use(input: string | Element): void;
   pause(): void;
   resume(): void;
-  update(target?: string | Element | NodeList | Array<Element>): void;
-  once(): void;
+  update(target?: string | Element): void;
+  once(target?: string | Element): void;
   ignore(...selectors: (string | Element)[]): void;
   unignore(...selectors: (string | Element)[]): void;
 }
