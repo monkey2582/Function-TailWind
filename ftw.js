@@ -22,7 +22,7 @@
     const pendingClasses = new Set();
 
     /** 已处理过的 DOM 元素（WeakSet，避免重复遍历） */
-    const processedElements = new WeakSet();
+    let processedElements = new WeakSet();
 
     /** MutationObserver 实例 */
     let mutationObserver = null;
@@ -1078,6 +1078,7 @@ function scanAllElements(force) {
      * 执行一次全量更新并暂停自动处理（用于一次性初始化）。
      */
     ftw.once = function() {
+        ftw.resume();
         scanAllElements(false);
         ftw.pause();
     };
