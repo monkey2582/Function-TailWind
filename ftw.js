@@ -1,1297 +1,1403 @@
 /**
- * ftw - 轻量级 CSS 工具库
- * 动态注册工具类（如 `bg-red`），自动生成对应样式并应用到元素上。
- * 支持内联 CSS、`@apply` 指令、响应式类名以及 DOM 变化监听。
- * @version 4.0.0
- * @author ftw contributors
+ * @file ftw.js - 动态原子化 CSS 引擎 (Fast Tailwind Utility)
+ * 这是一个运行时动态解析类名并生成、注入样式表的轻量级 CSS-in-JS 工具库包。
+ * @version 5.0.0
  */
-(function() {
-    'use strict';
 
-    // ========================================================================
-    // 内部状态
-    // ========================================================================
+!(function () {
+  // ==========================================
+  // 1. 全局状态与核心注册表定义
+  // ==========================================
 
-    /** 工具类配置映射：类名前缀 -> { regex, generator, numIdx, defaultAllNumbers } */
-    const classMap = new Map();
+  /** @type {Map<string, {regex: RegExp, generator: Function, idxOrder: Array<number|string>}>} 存储注册的工具类生成器 */
+  const utilityRules = new Map();
 
-    /** 已通过 `s()` 处理的类名集合（避免重复处理） */
-    const processedClasses = new Set();
+  /** @type {Set<string>} 忽略解析的特殊类名集合（直接添加到元素中，不走动态 CSS 生成） */
+  const ignoredClasses = new Set();
 
-    /** 待创建样式标签的类名集合（用于防止重复插入） */
-    const pendingClasses = new Set();
+  /** @type {Set<string>} 已处理过的类名缓存，防止重复解析 */
+  const processedClasses = new Set();
 
-    /** 已处理过的 DOM 元素（WeakSet，避免重复遍历） */
-    let processedElements = new WeakSet();
+  /** @type {WeakSet<Element>} 已处理过的 DOM 元素缓存，避免重复扫描 */
+  let processedElements = new WeakSet();
 
-    /** MutationObserver 实例 */
-    let mutationObserver = null;
+  /** @type {Map<string, string>} 存储已生成的类名与对应 CSS 属性字符串的映射 */
+  const generatedStylesMap = new Map();
 
-    /** 是否暂停自动处理（用于性能调优） */
-    let isProcessingPaused = false;
+  /** @type {MutationObserver|null} 监听 DOM 树变动，用于动态响应新元素的 Class 变化 */
+  let domObserver = null;
 
-    /** 用于 `update` 防抖的内部标志 */
-    let updateScheduled = false;
+  /** @type {boolean} 是否已调度 requestAnimationFrame 重置 processedElements 状态 */
+  let isRafScheduled = false;
 
-    /** 全局 MutationObserver 是否已启动 */
-    let observerStarted = false;
+  // 初始化动态样式表元素
+  let styleElement = document.getElementById("ftw-styles");
+  if (!styleElement) {
+    styleElement = document.createElement("style");
+    styleElement.id = "ftw-styles";
+    document.head.appendChild(styleElement);
+  }
 
-    // ========================================================================
-    // 工具函数
-    // ========================================================================
+  /** @type {CSSStyleSheet} 动态样式表的 CSSStyleSheet 实例 */
+  const styleSheet = styleElement.sheet;
 
-    /**
-     * 为指定类名生成并插入 `<style>` 标签。
-     * @param {string} className - CSS 类名（如 `bg-red`）
-     * @param {string} cssText  - CSS 规则体（如 `background:red;`）
-     */
-    function insertStyle(className, cssText) {
-        // 将类名中的特殊字符转义，用于 CSS 选择器
-        const safeSelector = className.replace(/[.*+?^${}()|[\]\\/:]/g, '\\$&');
-        const styleId = 'ftw-style-' + className.replace(/[^a-zA-Z0-9_-]/g, '');
-        const existing = document.getElementById(styleId);
-        if (existing) {
-            existing.textContent = `.${safeSelector}{${cssText}}`;
-            return;
-        }
-        // 标记为待处理，避免在样式插入过程中重复创建
-        if (!pendingClasses.has(className)) {
-            pendingClasses.add(className);
-        }
-        const style = document.createElement('style');
-        style.id = styleId;
-        style.textContent = `.${safeSelector}{${cssText}}`;
-        document.head.appendChild(style);
+  /** @type {Map<string, {index: number, refCount: number, alias: string}>} 类名到样式索引及引用计数的映射 */
+  const classRegistry = new Map();
+
+  /** @type {Map<string, {index: number, className: string}>} CSS 规则到索引及对应类名的映射（用于去重复） */
+  const cssRegistry = new Map();
+
+  /** @type {Set<string>} 已注册的原子类前缀集合 (例如: 'w', 'h', 'bg' 等) */
+  const utilityPrefixes = new Set();
+
+  // ==========================================
+  // 2. 样式注入与垃圾回收机制 (CSS Insertion & GC)
+  // ==========================================
+
+  /**
+   * 向全局 StyleSheet 中插入一条 CSS 规则
+   * @param {string} className 类名
+   * @param {string} cssDeclarationValue 具体的 CSS 声明 (例如 "color: red;")
+   */
+  function insertStyleRule(className, cssDeclarationValue) {
+    const existingClass = classRegistry.get(className);
+    if (existingClass) {
+      existingClass.refCount++;
+      return;
     }
 
-    /**
-     * 处理单个类名：如果是工具类则生成样式或直接应用。
-     * @param {string} className - 要处理的类名
-     * @param {Element} [element] - 可选的关联元素，用于直接应用类（非样式注入）
-     * @returns {boolean} 是否成功处理（匹配到工具类）
-     */
-    function processClass(className, element) {
-        // 特殊前缀 `not-util:` 表示强制将此名称作为普通类，不处理
-        if (className.startsWith('not-util:')) {
-            const realClass = className.slice(9);
-            if (element) {
-                element.classList.add(realClass);
-                processedClasses.add(realClass);
-            }
-            return true;
-        }
-        // 如果已经处理过，跳过
-        if (processedClasses.has(className)) {
-            return true;
-        }
-
-        let matchedKey = null;
-        // 遍历注册的工具，检查正则是否匹配
-        for (const [key, config] of classMap) {
-            if (config.regex.test(className)) {
-                matchedKey = key;
-                break;
-            }
-        }
-
-        // 如果匹配到工具，并且传入了元素，则移除其他同工具类的旧类（互斥）
-        if (matchedKey && element && element.classList) {
-            const config = classMap.get(matchedKey);
-            // 移除元素上所有属于同一工具但不同值的类
-            const classList = Array.from(element.classList);
-            for (const cls of classList) {
-                if (cls !== className && config.regex.test(cls)) {
-                    element.classList.remove(cls);
-                    // 同时移除对应的样式标签（如果有）
-                    const oldId = 'ftw-style-' + cls.replace(/[^a-zA-Z0-9_-]/g, '');
-                    const oldStyle = document.getElementById(oldId);
-                    if (oldStyle) oldStyle.remove();
-                }
-            }
-        }
-
-        // 遍历所有工具，尝试匹配并生成样式
-        for (const [key, config] of classMap) {
-            const match = className.match(config.regex);
-            if (!match) continue;
-
-            let args;
-            const rawParts = match[1] || '';
-            const parts = rawParts ? rawParts.split('-') : [];
-
-            if (config.defaultAllNumbers) {
-                // 如果所有部分都应为数字
-                if (!parts.every(p => /^\d+$/.test(p))) return false;
-                args = parts.map(Number);
-            } else {
-                // 仅指定索引处为数字
-                const numIdx = config.numIdx;
-                if (!numIdx.every(idx => idx < parts.length && /^\d+$/.test(parts[idx]))) {
-                    return false;
-                }
-                args = parts.map((p, i) => numIdx.includes(i) ? Number(p) : p);
-            }
-
-            // 调用生成器获取 CSS 内容
-            let css = config.generator(...args);
-            if (!css) return true; // 生成器返回空表示不产生样式，但视为处理成功
-
-            // 如果 CSS 中包含冒号（如 `:hover`），则作为样式规则插入
-            if (css.includes(':')) {
-                insertStyle(className, css);
-            } else if (element) {
-                // 否则将 CSS 拆分为多个类名并逐个应用到元素上
-                element.classList.remove(className);
-                const extraClasses = css.split(/\s+/).filter(Boolean);
-                applyClasses(element, ...extraClasses);
-            }
-            return true;
-        }
-
-        return false; // 未匹配任何工具
+    const existingCss = cssRegistry.get(cssDeclarationValue);
+    if (existingCss) {
+      classRegistry.set(className, {
+        index: existingCss.index,
+        refCount: 1,
+        alias: existingCss.className
+      });
+      return;
     }
 
-    /**
-     * 处理单个 DOM 元素的所有类名（扫描并应用工具类）。
-     * @param {Element} element - 要处理的元素
-     */
-    function processElement(element) {
-        if (!element.classList || !element.classList.length || element?.closest("[ftw-ignore]")) return;
+    // 转义类名以支持特殊字符 (如带有括号、斜杠、小数点的类名)
+    const escapedClass = window.CSS && CSS.escape 
+      ? CSS.escape(className) 
+      : className.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
 
-        // 检查是否包含任何可能为工具类的类名（快速筛选）
-        let hasPotential = false;
-        for (const cls of element.classList) {
-            if (!processedClasses.has(cls)) {
-                // 如果类名以任何注册的前缀开头，则可能是工具类
-                for (const prefix of classMap.keys()) {
-                    if (cls === prefix || cls.startsWith(prefix + '-')) {
-                        hasPotential = true;
-                        break;
-                    }
-                }
-                if (hasPotential) break;
-            }
-        }
-        if (!hasPotential) return;
+    const ruleText = `.${escapedClass}{${cssDeclarationValue}}`;
+    const newIndex = styleSheet.insertRule(ruleText, styleSheet.cssRules.length);
 
-        // 将元素加入已处理集合，避免重复处理
-        if (!processedElements.has(element)) {
-            processedElements.add(element);
-        }
+    classRegistry.set(className, { index: newIndex, refCount: 1 });
+    cssRegistry.set(cssDeclarationValue, { index: newIndex, className });
+  }
 
-        // 遍历所有类名，尝试处理
-        for (const cls of Array.from(element.classList)) {
-            // 如果类已在待处理集合（样式可能待插入），跳过
-            if (pendingClasses.has(cls)) continue;
-            processClass(cls, element);
+  /**
+   * 释放对某个类名样式规则的引用，若引用计数归零则彻底从样式表中移除
+   * @param {string} className 要移除的类名
+   */
+  function removeStyleRule(className) {
+    const registryInfo = classRegistry.get(className);
+    if (!registryInfo) return;
+
+    registryInfo.refCount--;
+    if (registryInfo.refCount <= 0) {
+      if (!registryInfo.alias) {
+        styleSheet.deleteRule(registryInfo.index);
+        // 从样式去重表中删除对应记录
+        cssRegistry.forEach((value, key) => {
+          if (value.index === registryInfo.index) {
+            cssRegistry.delete(key);
+          }
+        });
+      }
+      classRegistry.delete(className);
+      generatedStylesMap.delete(className);
+    }
+  }
+
+  /**
+   * 彻底的垃圾回收 (Garbage Collection)
+   * 扫描页面中所有的 DOM 节点，找出目前没有任何节点在使用的 ftw 样式规则，并从样式表中清除
+   */
+  function garbageCollectUnusedStyles() {
+    const activeClassesInDOM = new Set();
+    document.querySelectorAll("*").forEach(el => {
+      if (el.classList) {
+        el.classList.forEach(cls => activeClassesInDOM.add(cls));
+      }
+    });
+
+    for (const [registeredClass, registryInfo] of classRegistry) {
+      if (!activeClassesInDOM.has(registeredClass)) {
+        // 如果 DOM 中已无该类名，将引用计数扣减至 0 触发物理移除
+        while (registryInfo.refCount > 0) {
+          removeStyleRule(registeredClass);
         }
+      }
+    }
+  }
+
+  // ==========================================
+  // 3. 类名解析与原子样式生成核心 (Parsing & Generation)
+  // ==========================================
+
+  /**
+   * 处理单个类名，解析并生成其对应的样式规则
+   * @param {string} rawClass 原始类名 (例如 "w-10", "!bg-red-500", "not-util:my-custom-class")
+   * @param {Element} [targetElement] 携带该类名的目标 DOM 元素
+   * @returns {boolean} 是否成功处理该类名
+   */
+  function processUtilityClass(rawClass, targetElement) {
+    // 1. 处理不作为原子类解析的特殊跳过前缀 (not-util: / # 开头)
+    const bypassClass = rawClass.startsWith("not-util:")
+      ? rawClass.slice(9)
+      : rawClass.startsWith("#")
+      ? rawClass.slice(1)
+      : null;
+
+    if (bypassClass) {
+      if (targetElement) {
+        targetElement.classList.add(bypassClass);
+        ignoredClasses.add(bypassClass);
+      }
+      return true;
     }
 
-    /**
-     * 重置处理状态（用于 MutationObserver 批量处理后的清理）
-     */
-    function resetProcessedElements() {
-        processedElements = new WeakSet();
-        isProcessingPaused = false;
+    if (ignoredClasses.has(rawClass)) return true;
+
+    // 2. 匹配对应原子类的正则表达式生成器
+    let matchedRuleKey = null;
+    for (const [key, rule] of utilityRules) {
+      if (rule.regex.test(rawClass)) {
+        matchedRuleKey = key;
+        break;
+      }
     }
 
-    /**
-     * 加载并解析 `ftw-utils` 脚本（JSON 配置）。
-     * @param {string|Element} input - 脚本元素或 URL/内容
-     */
-    async function loadUtils(input) {
-        let text = null;
-        if (typeof input === 'string') {
-            text = input;
-        } else if (input && input.tagName === 'SCRIPT') {
-            if (input.dataset.ftwProcessed) return;
-            input.dataset.ftwProcessed = 'true';
-            if (input.src) {
-                try {
-                    const resp = await fetch(input.src);
-                    text = await resp.text();
-                } catch (err) {
-                    console.error(`ftw-utils: 加载 ${input.src} 失败`, err);
-                    return;
-                }
-            } else {
-                text = input.textContent.trim();
-            }
-        } else {
-            return;
+    // 3. 处理排他类（如果该元素已有同类型规则，则移除旧的引用，替换为新的）
+    if (matchedRuleKey && targetElement && targetElement.classList) {
+      const ruleDef = utilityRules.get(matchedRuleKey);
+      for (const currentClass of Array.from(targetElement.classList)) {
+        if (currentClass !== rawClass && ruleDef.regex.test(currentClass)) {
+          targetElement.classList.remove(currentClass);
+          removeStyleRule(currentClass);
         }
-        if (!text) return;
+      }
+    }
 
+    // 4. 解析修饰符（支持 ! 前缀，用于强制转为 !important）
+    let isImportant = false;
+    let baseClass = rawClass;
+    for (const prefix of utilityPrefixes) {
+      if (rawClass === "!" + prefix || rawClass.startsWith("!" + prefix + "-")) {
+        isImportant = true;
+        baseClass = rawClass.slice(1); // 剥离 '!'
+        break;
+      }
+    }
+
+    // 5. 正式提取参数并生成样式
+    for (const [ruleKey, ruleDef] of utilityRules) {
+      const matches = baseClass.match(ruleDef.regex);
+      if (!matches) continue;
+
+      // 提取横杠分隔的数值或字符串参数
+      const rawParams = matches[1] ? matches[1].split("-") : [];
+      const orderDef = ruleDef.idxOrder || [];
+      const typesList = ruleKey.split(":").slice(1).map(t => (t === "num" ? "num" : "str"));
+
+      let processedParams = [];
+      if (orderDef.length === 0) {
+        processedParams = rawParams.map((val, idx) => {
+          const expectedType = idx < typesList.length ? typesList[idx] : "str";
+          return expectedType === "num" ? Number(val) : val;
+        });
+      } else {
+        processedParams = orderDef.map((orderIdx, idx) => {
+          const rawVal = orderIdx < rawParams.length ? rawParams[orderIdx] : "";
+          const expectedType = idx < typesList.length ? typesList[idx] : "str";
+          return expectedType === "num" ? Number(rawVal) : rawVal;
+        });
+      }
+
+      // 如果期望数字但解析为 NaN，说明不是合法匹配
+      if (
+        processedParams.some(
+          (val, idx) => (idx < typesList.length ? typesList[idx] : "str") === "num" && Number.isNaN(val)
+        )
+      ) {
+        continue;
+      }
+
+      // 执行生成器函数产生 CSS 样式值
+      let cssDeclaration = ruleDef.generator(...processedParams);
+      if (cssDeclaration) {
+        if (isImportant) {
+          // 如果带有 '!' 前缀，所有 CSS 规则追加 !important
+          cssDeclaration = cssDeclaration
+            .split(";")
+            .map(part => {
+              const trimmed = part.trim();
+              return trimmed ? trimmed + (trimmed.includes("!important") ? "" : " !important") : "";
+            })
+            .filter(Boolean)
+            .join(";");
+        }
+        generatedStylesMap.set(rawClass, cssDeclaration);
+      }
+
+      if (!cssDeclaration) return false;
+
+      // 如果生成的代码段中带有冒号 ':' 说明是具体的 CSS 属性（如 color:red），插入样式表。
+      // 如果是一串其他类名，说明是别名（Alias），直接应用这些类名并从元素中卸载当前的别名。
+      if (cssDeclaration.includes(":")) {
+        insertStyleRule(rawClass, cssDeclaration);
+      } else if (targetElement) {
+        targetElement.classList.remove(rawClass);
+        cssDeclaration.split(/\s+/).filter(Boolean).forEach(cls => targetElement.classList.add(cls));
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * 解析某个元素中的所有 Class，过滤并处理原子类
+   * @param {Element} element DOM 元素
+   */
+  function processElementClasses(element) {
+    if (!element.classList || !element.classList.length || element?.closest("[ftw-ignore]")) return;
+
+    let hasAtomicClass = false;
+    for (const className of element.classList) {
+      if (!ignoredClasses.has(className)) {
+        for (const prefix of utilityPrefixes) {
+          if (className === prefix || className.startsWith(prefix + "-")) {
+            hasAtomicClass = true;
+            break;
+          }
+        }
+        if (hasAtomicClass) break;
+      }
+    }
+
+    if (hasAtomicClass) {
+      if (!processedElements.has(element)) {
+        processedElements.add(element);
+      }
+      element.classList.forEach(className => {
+        if (!processedClasses.has(className)) {
+          processUtilityClass(className, element);
+        }
+      });
+    }
+  }
+
+  /**
+   * 重置已处理元素的 WeakSet 缓存
+   */
+  function resetProcessedCache() {
+    processedElements = new WeakSet();
+    isRafScheduled = false;
+  }
+
+  // ==========================================
+  // 4. JSON / FSS (Style Sheet) 特效配置解析
+  // ==========================================
+
+  /**
+   * 解析页面中引入的配置脚本 (支持从 data-ftw-processed 配置中获取 JSON)
+   * @param {Element|string} targetScript
+   */
+  async function parseScriptUtility(targetScript) {
+    let rawText = null;
+    if (typeof targetScript === "string") {
+      rawText = targetScript;
+    } else {
+      if (!targetScript || targetScript.tagName !== "SCRIPT") return;
+      if (targetScript.dataset.ftwProcessed) return;
+
+      targetScript.dataset.ftwProcessed = "true";
+      if (targetScript.src) {
         try {
-            const config = JSON.parse(text);
-            window.ftw.util(config);
+          const response = await fetch(targetScript.src);
+          rawText = await response.text();
         } catch (err) {
-            console.error('ftw-utils: JSON 解析失败', err);
+          console.error(`ftw-utils: 加载外部配置失败: ${targetScript.src}`, err);
+          return;
         }
+      } else {
+        rawText = targetScript.textContent.trim();
+      }
     }
 
-    /**
-     * 解析并渲染 `ftw-render` 样式标签或链接（支持 `@ftw-util` 和 `@apply` 指令）。
-     * @param {HTMLStyleElement|HTMLLinkElement} node - 样式元素
-     */
-    function renderStyleNode(node) {
-        if (node.dataset.ftwProcessed) return;
-        node.dataset.ftwProcessed = 'true';
-
-        let content;
-        if (node.tagName === 'STYLE') {
-            content = node.textContent;
-        } else if (node.tagName === 'LINK' && node.rel === 'stylesheet') {
-            fetch(node.href)
-                .then(res => res.text())
-                .then(css => {
-                    const style = document.createElement('style');
-                    style.textContent = css;
-                    renderStyleNode(style);
-                })
-                .catch(err => console.warn(`ftw: 无法加载 ${node.href} 的 FSS 样式表`, err));
-            return;
-        } else {
-            return;
-        }
-
-        // 移除 CSS 注释
-        let css = content.replace(/\/\*[\s\S]*?\*\//g, '');
-
-        // 处理 @ftw-util 指令（用于定义内联工具）
-        let pos = css.indexOf('@ftw-util');
-        while (pos !== -1) {
-            const result = parseFtUtilBlock(css, pos);
-            if (!result) break;
-            const { length, replaced } = result;
-            css = css.slice(0, pos) + replaced + css.slice(pos + length);
-            pos = css.indexOf('@ftw-util');
-        }
-
-        // 处理普通 CSS 规则，提取 @apply 和直接属性
-        const ruleRegex = /([^{}]+?)\s*\{\s*([^{}]*?)\s*\}/g;
-        let match;
-        while ((match = ruleRegex.exec(css)) !== null) {
-            const selector = match[1].trim();
-            const declarations = match[2].trim();
-
-            // 提取 @apply 指令
-            const applyRegex = /(@apply\s+([^;]+);?)/g;
-            const applyClasses = [];
-            let cleanedDeclarations = declarations;
-            let applyMatch;
-            while ((applyMatch = applyRegex.exec(declarations)) !== null) {
-                const full = applyMatch[1].trim();
-                applyClasses.push(...full.split(/\s+/).filter(Boolean));
-                cleanedDeclarations = cleanedDeclarations.replace(applyMatch[0], '');
-            }
-            cleanedDeclarations = cleanedDeclarations.replace(/;?\s*$/, '').trim();
-
-            // 如果选择器是简单类（不包含伪类/伪元素/属性选择器），则可以作为工具类应用
-            const isSimpleSelector = (sel) => {
-                const stripped = sel.replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, '');
-                return !/:(?!is\(|where\(|not\(|has\()[\w-]|::|\[/.test(stripped);
-            };
-
-            if (applyClasses.length > 0 && isSimpleSelector(selector)) {
-                // 将 @apply 类作为工具类应用到选择器对应的元素
-                window.ftw(selector, ...applyClasses);
-            }
-            if (cleanedDeclarations) {
-                // 将普通声明作为内联样式注入（使用 window.ftw 处理）
-                window.ftw(selector, cleanedDeclarations);
-            }
-        }
+    if (rawText) {
+      try {
+        const configJson = JSON.parse(rawText);
+        ftw.util(configJson);
+      } catch (err) {
+        console.error("ftw-utils: 配置 JSON 解析失败", err);
+      }
     }
+  }
 
+  /**
+   * 解析含有自定义 @ftw-util 的 CSS 样式标签或外链样式表
+   * @param {Element} styleTag STYLE 标签或 LINK 样式表标签
+   */
+  function parseStyleRender(styleTag) {
     /**
-     * 解析 @ftw-util 块（类似 JSON 工具定义）
+     * 辅助解析：递归提取大括号 {} 内的代码块并转换为 ftw.util 工具注册
      */
-    function parseFtUtilBlock(css, start) {
-        const afterAt = start + 9;
-        let i = afterAt;
-        while (i < css.length && /\s/.test(css[i])) i++;
-        if (css[i] !== '{') return null;
+    function extractUtilityBlock(text, keywordIndex) {
+      const remainingText = text.slice(keywordIndex + 9);
+      let whitespaceOffset = 0;
+      while (whitespaceOffset < remainingText.length && /\s/.test(remainingText[whitespaceOffset])) {
+        whitespaceOffset++;
+      }
 
-        const block = findMatchingBlock(css, i);
-        if (!block) return null;
-        const blockContent = block.content;
-        const blockLength = block.length;
+      if (remainingText[whitespaceOffset] === "{") {
+        const block = findClosingCurlyBrace(remainingText, whitespaceOffset);
+        if (block === null) return null;
 
-        // 解析块内多个工具定义（每行一个）
-        let offset = 0;
-        while (offset < blockContent.length) {
-            // 跳过空白
-            while (offset < blockContent.length && /\s/.test(blockContent[offset])) offset++;
-            if (offset >= blockContent.length) break;
+        let content = block;
+        let scanIdx = 0;
+        while (scanIdx < content.length) {
+          while (scanIdx < content.length && /\s/.test(content[scanIdx])) {
+            scanIdx++;
+          }
+          if (scanIdx >= content.length) break;
 
-            // 找到工具名称（直到 '{' 或换行）
-            let nameEnd = offset;
-            while (nameEnd < blockContent.length && blockContent[nameEnd] !== '{' && blockContent[nameEnd] !== '}') {
-                nameEnd++;
+          let startIdx = scanIdx;
+          let braceIdx = -1;
+          for (; scanIdx < content.length; ) {
+            if (content[scanIdx] === "{" && scanIdx > 0 && content[scanIdx - 1] !== "-") {
+              braceIdx = scanIdx;
+              break;
             }
-            const name = blockContent.slice(offset, nameEnd).trim();
-            if (!name || name.includes('{') || name.includes('}')) {
-                offset = nameEnd + 1;
-                continue;
-            }
+            scanIdx++;
+          }
+          if (braceIdx === -1) break;
 
-            // 找到对应的值块
-            const valueBlock = findMatchingBlock(blockContent, nameEnd);
-            if (valueBlock) {
-                const value = valueBlock.content;
-                window.ftw.util(name, value);
-                offset = nameEnd + valueBlock.length + 2;
-            } else {
-                offset = nameEnd + 1;
-            }
+          const utilityName = content.slice(startIdx, braceIdx).trim();
+          if (!utilityName || utilityName.includes("{") || utilityName.includes("}")) {
+            scanIdx = braceIdx + 1;
+            continue;
+          }
+
+          const innerBlock = findClosingCurlyBrace(content, braceIdx);
+          if (innerBlock !== null) {
+            ftw.util(utilityName, innerBlock);
+            scanIdx = braceIdx + innerBlock.length + 2;
+          } else {
+            scanIdx = braceIdx + 1;
+          }
         }
-
-        // 返回替换后的内容（移除 @ftw-util 块）
-        return {
-            length: blockLength + 9,
-            replaced: ''
-        };
-    }
-
-    /**
-     * 查找匹配的 `{ ... }` 块（支持嵌套）
-     */
-    function findMatchingBlock(str, openIdx) {
-        if (str[openIdx] !== '{') return null;
-        let depth = 1;
-        let braceCount = 0; // 用于忽略转义？
-        let i = openIdx + 1;
-        while (i < str.length && (depth > 0 || braceCount > 0)) {
-            const ch = str[i];
-            const prev = str[i - 1];
-            if (ch === '{' && prev !== '-') {
-                depth++;
-            } else if (ch === '{' && prev === '-') {
-                braceCount++;
-            } else if (ch === '}' && braceCount > 0) {
-                braceCount--;
-            } else if (ch === '}' && depth > 0) {
-                depth--;
-            }
-            i++;
+        return { length: whitespaceOffset + block.length + 2 };
+      } else {
+        let braceStart = whitespaceOffset;
+        while (braceStart < remainingText.length && remainingText[braceStart] !== "{") {
+          braceStart++;
         }
-        if (depth === 0 && braceCount === 0) {
-            return {
-                content: str.slice(openIdx + 1, i - 1),
-                length: i - openIdx
-            };
+        const utilityName = remainingText.slice(whitespaceOffset, braceStart).trim();
+        const block = findClosingCurlyBrace(remainingText, braceStart);
+        if (block !== null && utilityName) {
+          ftw.util(utilityName, block);
+          return { length: braceStart + block.length + 2 };
         }
         return null;
+      }
     }
 
-    // ========================================================================
-    // 核心 API：ftw 函数
-    // ========================================================================
-
     /**
-     * 核心函数：将工具类或内联样式应用到元素。
-     * @param {string|Element} selector - CSS 选择器字符串或 DOM 元素
-     * @param {...(string)} classes - 要应用的类名或 CSS 声明（如 'bg-red' 或 'color:red'）
-     * @example
-     * ftw('.my-div', 'bg-blue', 'text-white');
-     * ftw(document.getElementById('foo'), 'p-4', 'font-bold');
+     * 辅助解析：寻找闭合的 } 括号并捕获其内容
      */
-    function ftw(selector, ...args) {
-        const appliedClasses = [];
-        const inlineStyles = [];
-
-        // 分离类名和内联样式
-        for (const arg of args) {
-            if (typeof arg === 'string') {
-                arg.split(/[;\s]+/).filter(Boolean).forEach(item => {
-                    if (item.includes(':')) {
-                        inlineStyles.push(item);
-                    } else {
-                        appliedClasses.push(item);
-                    }
-                });
-            }
+    function findClosingCurlyBrace(text, openIndex) {
+      if (text[openIndex] !== "{") return null;
+      let depth = 1;
+      let negativeLookBehindDepth = 0;
+      let idx = openIndex + 1;
+      for (; idx < text.length && (depth > 0 || negativeLookBehindDepth > 0); ) {
+        const char = text[idx];
+        const prevChar = text[idx - 1];
+        if (char === "{" && prevChar !== "-") {
+          depth++;
+        } else if (char === "{" && prevChar === "-") {
+          negativeLookBehindDepth++;
+        } else if (char === "}" && negativeLookBehindDepth > 0) {
+          negativeLookBehindDepth--;
+        } else if (char === "}" && depth > 0) {
+          depth--;
         }
-
-        // 处理内联样式：生成对应的 `<style>` 标签
-        if (inlineStyles.length) {
-            if (selector instanceof Element) {
-                // 为特定元素生成选择器（tag#id.class）
-                const tag = selector.tagName.toLowerCase();
-                const id = selector.id ? '#' + selector.id : '';
-                const cls = selector.className ? '.' + selector.className.split(/\s+/).join('.') : '';
-                const fullSelector = tag + id + cls;
-                const style = document.createElement('style');
-                style.textContent = `${fullSelector}{${inlineStyles.join(';')};}`;
-                document.head.appendChild(style);
-            } else if (typeof selector === 'string' && selector) {
-                // 检查是否是复杂选择器（包含伪类/伪元素等）
-                const stripped = selector.replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, '');
-                if (/:(?!is\(|where\(|not\(|has\()[\w-]|::|\[/.test(stripped)) {
-                    console.error(`ftw: 复杂选择器 "${selector}" 不支持内联 CSS`);
-                } else {
-                    const style = document.createElement('style');
-                    style.textContent = `${selector}{${inlineStyles.join(';')};}`;
-                    document.head.appendChild(style);
-                }
-            }
-        }
-
-        // 处理类名应用
-        if (selector instanceof Element) {
-            const el = selector;
-            appliedClasses.forEach(cls => {
-                el.classList.add(cls);
-                processClass(cls, el);
-            });
-        } else if (typeof selector === 'string' && selector) {
-            // 如果 selector 是包含大括号的字符串，可能是一种快捷语法：`selector{...}`
-            if (appliedClasses.length === 0 && selector.includes('{')) {
-                const match = selector.match(/^(.+?)\s*\{(.+)\}$/s);
-                if (match) {
-                    const sel = match[1].trim();
-                    const content = match[2].trim();
-                    if (content) {
-                        ftw(sel, ...content.split(/[;\s]+/).filter(Boolean));
-                        return;
-                    }
-                }
-            }
-            // 否则作为选择器查询
-            const elements = document.querySelectorAll(selector);
-            elements.forEach(el => {
-                appliedClasses.forEach(cls => {
-                    el.classList.add(cls);
-                    processClass(cls, el);
-                });
-            });
-        }
+        idx++;
+      }
+      return depth === 0 && negativeLookBehindDepth === 0 ? text.slice(openIndex + 1, idx - 1) : null;
     }
 
-    // ========================================================================
-    // 工具类注册（ftw.util）
-    // ========================================================================
+    if (styleTag.dataset.ftwProcessed) return;
+    styleTag.dataset.ftwProcessed = "true";
 
-    /**
-     * 注册工具类（或批量注册）。
-     * @param {string|Object} keyOrConfig - 单个工具名或配置对象
-     * @param {string|Function|Array} [value] - 当 keyOrConfig 为字符串时，指定生成器或值
-     * @param {Array<number>} [numIdx] - 指定哪些参数应该被解析为数字（索引）
-     * @example
-     * ftw.util('bg-red', 'background:red');
-     * ftw.util('text-', (size) => `font-size:${size}px`);
-     * ftw.util({ 'p-': (v) => `padding:${v}px` });
-     */
-    ftw.util = function(keyOrConfig, value, numIdx) {
-        // 保留全局对象名称列表，用于表达式编译
-        const globalNames = new Set([
-            'Math', 'Number', 'String', 'Array', 'Object', 'Boolean',
-            'Date', 'RegExp', 'JSON', 'Promise', 'Symbol',
-            'Map', 'Set', 'WeakMap', 'WeakSet',
-            'isNaN', 'isFinite', 'parseInt', 'parseFloat',
-            'decodeURI', 'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
-            'escape', 'unescape', 'typeof', 'instanceof'
-        ]);
+    const isScoped = styleTag.hasAttribute("ftw-scoped");
+    const scopeSelector = isScoped ? "[ftw-scoped]" : "";
 
-        // 安全的表达式字符正则
-        const safeExprRegex = /^[a-zA-Z0-9_\.\[\]\'\"\s\(\)\+\-\*\/\%\?\:\,\|\&\!\=\<\>]+$/;
+    if (styleTag.tagName === "STYLE") {
+      (function processStyles(cssText) {
+        // 清理注释，转换不规范的 !imp 简写
+        let sanitizedText = cssText
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/!imp(?=\s|;|$|})/g, "!important");
 
-        /**
-         * 编译一个表达式字符串（支持 `${...}` 插值）为函数。
-         */
-        function compileTemplate(template, paramNames, contextVars, defaultNumIdx) {
-            // 解析插值 ${...}
-            const placeholderRegex = /(?<!\$)\{([^{}]*)\}/g;
-            const parts = [];
-            let match;
-            while ((match = placeholderRegex.exec(template)) !== null) {
-                parts.push({
-                    full: match[0],
-                    raw: match[1],
-                    start: match.index,
-                    end: match.index + match[0].length
-                });
-            }
-
-            if (parts.length === 0) {
-                // 没有插值，直接返回静态字符串
-                return function() { return template; };
-            }
-
-            // 存储变量映射
-            let varMap = {};
-            let varCount = 0;
-            const exprParts = [];
-
-            for (let part of parts) {
-                let expr = part.raw.replace(/\/\*[\s\S]*?\*\//g, '').trim();
-                if (!expr) {
-                    exprParts.push({ type: 'empty' });
-                    continue;
-                }
-
-                // 纯数字字面量
-                if (/^\d+$/.test(expr)) {
-                    exprParts.push({ type: 'number', value: Number(expr) });
-                    continue;
-                }
-
-                // 检测是否有赋值操作（如 `x = 5`）
-                let varName = null;
-                let rightExpr = null;
-                let hasAssignment = false;
-                let eqPos = -1;
-                let braceDepth = 0;
-                let inString = false;
-                let stringChar = null;
-                let escape = false;
-
-                for (let i = 0; i < expr.length; i++) {
-                    const ch = expr[i];
-                    if (inString) {
-                        if (escape) { escape = false; continue; }
-                        if (ch === '\\') { escape = true; continue; }
-                        if (ch === stringChar) { inString = false; }
-                        continue;
-                    }
-                    if (ch === '"' || ch === "'") {
-                        inString = true;
-                        stringChar = ch;
-                        continue;
-                    }
-                    if (ch === '(' || ch === '[' || ch === '{') {
-                        braceDepth++;
-                        continue;
-                    }
-                    if (ch === ')' || ch === ']' || ch === '}') {
-                        braceDepth--;
-                        continue;
-                    }
-                    if (braceDepth === 0 && ch === '=') {
-                        // 检查是否是赋值（不是比较）
-                        if (i > 0 && (expr[i-1] === '!' || expr[i-1] === '=')) continue;
-                        if (i+1 < expr.length && expr[i+1] === '=') continue;
-                        if (i > 0 && (expr[i-1] === '>' || expr[i-1] === '<')) continue;
-                        eqPos = i;
-                        break;
-                    }
-                }
-
-                let finalExpr = expr;
-                if (eqPos !== -1) {
-                    const left = expr.slice(0, eqPos).trim();
-                    const right = expr.slice(eqPos + 1).trim();
-                    if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(left)) {
-                        varName = left;
-                        rightExpr = right;
-                        hasAssignment = true;
-                        finalExpr = right;
-                    }
-                }
-
-                // 检查表达式是否安全（防止注入）
-                if (!safeExprRegex.test(finalExpr)) {
-                    console.warn(`ftw.util: 工具 "${key}" 的表达式包含非法字符: "${part.raw}"`);
-                    exprParts.push({ type: 'static', value: '' });
-                    continue;
-                }
-
-                // 提取所有标识符（变量名）
-                const identRegex = /(?<![a-zA-Z0-9_\.])([a-zA-Z_][a-zA-Z0-9_]*)(?![a-zA-Z0-9_])/g;
-                const identifiers = [];
-                let idMatch;
-                while ((idMatch = identRegex.exec(finalExpr)) !== null) {
-                    identifiers.push(idMatch[1]);
-                }
-                // 去重
-                const uniqueVars = [...new Set(identifiers)];
-
-                // 构建替换映射：变量名 -> 替换名（上下文变量或参数）
-                const replaceMap = {};
-                for (let v of uniqueVars) {
-                    if (globalNames.has(v)) continue; // 全局变量保留
-                    if (contextVars && v in contextVars) {
-                        replaceMap[v] = '__ctx_' + v;
-                    } else if (v === 'props') {
-                        replaceMap[v] = '__props';
-                    } else {
-                        // 作为参数（通过索引访问）
-                        if (!(v in varMap)) {
-                            varMap[v] = varCount++;
-                        }
-                        replaceMap[v] = `__uvars[${varMap[v]}]`;
-                    }
-                }
-
-                // 如果有赋值左边的变量，也需要映射
-                if (hasAssignment && varName) {
-                    if (!replaceMap[varName]) {
-                        if (contextVars && varName in contextVars) {
-                            replaceMap[varName] = '__ctx_' + varName;
-                        } else if (varName === 'props') {
-                            replaceMap[varName] = '__props';
-                        } else {
-                            if (!(varName in varMap)) {
-                                varMap[varName] = varCount++;
-                            }
-                            replaceMap[varName] = `__uvars[${varMap[varName]}]`;
-                        }
-                    }
-                    // 构建完整的赋值表达式
-                    finalExpr = `(${replaceMap[varName]} !== undefined ? ${replaceMap[varName]} : (${finalExpr}))`;
-                }
-
-                // 替换变量
-                let compiledExpr = finalExpr;
-                const replacements = [];
-                identRegex.lastIndex = 0;
-                while ((idMatch = identRegex.exec(finalExpr)) !== null) {
-                    const v = idMatch[1];
-                    if (replaceMap[v]) {
-                        replacements.push({
-                            pos: idMatch.index,
-                            len: v.length,
-                            rep: replaceMap[v]
-                        });
-                    }
-                }
-                // 从后往前替换
-                for (let i = replacements.length - 1; i >= 0; i--) {
-                    const r = replacements[i];
-                    compiledExpr = compiledExpr.slice(0, r.pos) + r.rep + compiledExpr.slice(r.pos + r.len);
-                }
-
-                exprParts.push({
-                    type: 'expr',
-                    expr: compiledExpr,
-                    rawExpr: part.raw
-                });
-            }
-
-            // 构建模板字符串片段
-            const staticParts = [];
-            let lastEnd = 0;
-            for (let part of parts) {
-                staticParts.push(template.slice(lastEnd, part.start));
-                lastEnd = part.end;
-            }
-            staticParts.push(template.slice(lastEnd));
-
-            // 编译每个表达式部分为函数
-            const compiledFuncs = exprParts.map(function(part) {
-                if (part.type === 'empty') return () => '';
-                if (part.type === 'number') return () => String(part.value);
-                if (part.type === 'static') return () => part.value;
-
-                // 构建动态函数
-                const paramList = [...globalNames];
-                const paramValues = paramList.map(name => {
-                    if (typeof window !== 'undefined' && name in window) return window[name];
-                    if (typeof global !== 'undefined' && name in global) return global[name];
-                    if (typeof self !== 'undefined' && name in self) return self[name];
-                    return undefined;
-                });
-
-                // 添加上下文变量
-                const ctxKeys = [];
-                const ctxValues = [];
-                if (contextVars) {
-                    for (let key in contextVars) {
-                        ctxKeys.push('__ctx_' + key);
-                        ctxValues.push(contextVars[key]);
-                    }
-                }
-
-                return function(args, props) {
-                    const allArgs = paramList.slice();
-                    const allValues = paramValues.slice();
-                    // 传递上下文变量
-                    for (let i = 0; i < ctxKeys.length; i++) {
-                        allArgs.push(ctxKeys[i]);
-                        allValues.push(ctxValues[i]);
-                    }
-                    allArgs.push('__props');
-                    allValues.push(props);
-                    // 传递参数数组
-                    allArgs.push('__uvars');
-                    allValues.push(args);
-                    try {
-                        const fn = new Function(...allArgs, `return (${part.expr})`);
-                        return String(fn(...allValues));
-                    } catch (err) {
-                        console.warn(`ftw.util: 工具 "${key}" 的表达式编译失败: "${part.rawExpr}"`, err);
-                        return '';
-                    }
-                };
-            });
-
-            // 返回最终的渲染函数
-            return function() {
-                const args = Array.prototype.slice.call(arguments);
-                // 根据 numIdx 将对应索引转换为数字
-                const converted = args.map((val, i) => {
-                    if (defaultNumIdx && defaultNumIdx.includes(i)) return Number(val);
-                    return val;
-                });
-                // 构建上下文对象（从参数中按索引提取）
-                const ctx = {};
-                if (contextVars) {
-                    for (let key in contextVars) {
-                        const idx = contextVars[key];
-                        ctx[key] = (idx !== undefined && idx < converted.length) ? converted[idx] : undefined;
-                    }
-                }
-                let result = staticParts[0];
-                for (let i = 0; i < compiledFuncs.length; i++) {
-                    result += compiledFuncs[i](converted, ctx);
-                    result += staticParts[i+1];
-                }
-                return result;
-            };
+        // 处理 @ftw-util 语法结构
+        let utilKeywordIndex = sanitizedText.indexOf("@ftw-util");
+        while (utilKeywordIndex !== -1) {
+          const parsedObj = extractUtilityBlock(sanitizedText, utilKeywordIndex);
+          if (parsedObj === null) break;
+          sanitizedText = sanitizedText.slice(0, utilKeywordIndex) + sanitizedText.slice(utilKeywordIndex + 9 + parsedObj.length);
+          utilKeywordIndex = sanitizedText.indexOf("@ftw-util");
         }
 
-        /**
-         * 辅助：从数组或对象中提取参数索引映射。
-         */
-        function extractParamMap(arr, funcStr) {
-            if (!Array.isArray(arr)) return [];
-            // 获取函数参数名列表（用于字符串索引）
-            const getParamNames = (fnStr) => {
-                const match = fnStr.toString().match(/^(?:function\s*\w*\s*)?\(([^)]*)\)|^\(([^)]*)\)\s*=>/);
-                if (match) {
-                    const params = (match[1] || match[2] || '').split(',').map(s => s.trim()).filter(Boolean);
-                    return params;
-                }
-                return [];
-            };
-            const paramNames = getParamNames(funcStr);
-            return arr.map(item => {
-                if (typeof item === 'number') return item;
-                if (typeof item === 'string') {
-                    const idx = paramNames.indexOf(item);
-                    if (idx === -1) console.warn(`ftw.util: 参数名 "${item}" 无效，已忽略`);
-                    return idx;
-                }
-                return -1;
-            }).filter(idx => idx !== -1);
+        // 解析一般的 CSS 选择器匹配和 @apply 别名混入
+        let match;
+        const cssRuleRegex = /([^{}]+?)\s*\{\s*([^{}]*?)\s*\}/g;
+        const isSimpleSelector = sel => {
+          const cleanSel = sel.replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, "");
+          return !/:(?!is\(|where\(|not\(|has\()[\w-]|::|\[/.test(cleanSel);
+        };
+
+        while ((match = cssRuleRegex.exec(sanitizedText)) !== null) {
+          let selector = match[1].trim();
+          let rulesBody = match[2].trim();
+          const applyRegex = /(@apply\s+([^;]+);?)/g;
+          let appliedClasses = [];
+          let filteredRulesBody = rulesBody;
+
+          let applyMatch;
+          while ((applyMatch = applyRegex.exec(rulesBody)) !== null) {
+            const rawClasses = applyMatch[1].trim();
+            appliedClasses.push(...rawClasses.split(/\s+/).filter(Boolean));
+            filteredRulesBody = filteredRulesBody.replace(applyMatch[0], "");
+          }
+
+          filteredRulesBody = filteredRulesBody.replace(/;?\s*$/, "").trim();
+          if (scopeSelector) {
+            selector = selector.split(",").map(sel => `${sel.trim()}${scopeSelector}`).join(",");
+          }
+
+          // 将 @apply 类名绑定并渲染到目标选择器
+          if (appliedClasses.length > 0 && isSimpleSelector(selector)) {
+            ftw(selector, ...appliedClasses);
+          }
+          if (filteredRulesBody) {
+            ftw(selector, ...filteredRulesBody.split(/[;\s]+/).filter(Boolean));
+          }
         }
-
-        /**
-         * 处理单个工具注册。
-         */
-        function registerSingle(key, generator, numIdxArray) {
-            // 构建正则表达式：^key(?:-([\\w-]+))?$
-            const regex = new RegExp('^' + key + '(?:-([\\w-]+))?$');
-            const config = {
-                regex: regex,
-                generator: generator,
-                numIdx: numIdxArray || [],
-                defaultAllNumbers: false // 由调用者决定
-            };
-            classMap.set(key, config);
-            // 将 key 作为前缀加入判断集合
-            pendingClasses.add(key);
-            // 触发一次全局更新
-            scheduleUpdate();
-        }
-
-        // ----- 主逻辑 -----
-
-        if (typeof keyOrConfig === 'object' && keyOrConfig !== null) {
-            // 批量注册：{ 'prefix': generator }
-            for (let key in keyOrConfig) {
-                if (!keyOrConfig.hasOwnProperty(key)) continue;
-                const val = keyOrConfig[key];
-                // 处理不同的 generator 形式
-                let generator = normalizeGenerator(val, key);
-                let numIdx = generator._numIdx || [];
-                registerSingle(key, generator, numIdx);
-            }
-            scheduleUpdate();
-            return;
-        }
-
-        // 单个注册
-        if (typeof keyOrConfig === 'string') {
-            const key = keyOrConfig;
-            let generator = normalizeGenerator(value, key);
-            let numIdx = generator._numIdx || [];
-            // 如果提供了 numIdx 参数，则覆盖
-            if (Array.isArray(numIdx) && numIdx.every(i => typeof i === 'number')) {
-                // 保持
-            } else if (value && typeof value === 'function') {
-                // 尝试从函数参数名推断
-                // 但这里不自动推断，留给用户显式传递
-            }
-            registerSingle(key, generator, numIdx);
-            scheduleUpdate();
-        }
-    };
-
-    /**
-     * 规范化 generator：可以是字符串、函数或数组。
-     */
-    function normalizeGenerator(value, key) {
-        if (typeof value === 'function') {
-            return value;
-        }
-        if (typeof value === 'string') {
-            // 如果是纯字符串，作为静态 CSS
-            if (!/=>|function/.test(value)) {
-                // 编译为函数
-                const compiled = compileTemplate(value, [], null, []);
-                return function() { return compiled.apply(null, arguments); };
-            }
-            // 否则尝试解析为函数字符串
-            try {
-                return new Function('return ' + value)();
-            } catch (e) {
-                console.warn(`ftw.util: 工具 "${key}" 函数字符串解析失败`, e);
-                return function() { return ''; };
-            }
-        }
-        if (Array.isArray(value)) {
-            // 数组格式：[generator, numIdxArray, paramMap]
-            const generator = value[0];
-            const numIdx = value[1];
-            const paramMap = value[2];
-            // 提取索引
-            let idxArray = [];
-            if (Array.isArray(numIdx) && numIdx.every(i => typeof i === 'number')) {
-                idxArray = numIdx;
-            } else if (typeof numIdx === 'object' && numIdx !== null) {
-                // 对象映射 { paramName: index }
-                // 从 generator 字符串中获取参数名
-                // 这里简化处理，交给 extractParamMap
-                // ...
-            }
-            // 等等，我们保留原始结构，由调用者处理
-            // 暂时返回一个函数
-            const genFunc = typeof generator === 'function' ? generator : function() { return String(generator); };
-            genFunc._numIdx = idxArray;
-            return genFunc;
-        }
-        // 其他类型转为字符串
-        return function() { return String(value); };
-    }
-
-    // ========================================================================
-    // DOM 渲染与更新调度
-    // ========================================================================
-
-    /**
-     * 调度一次更新（遍历所有元素处理新类）。
-     */
-function scheduleUpdate() {
-    if (isProcessingPaused) return;
-
-    if (updateScheduled) return;
-    updateScheduled = true;
-    requestIdleCallback(() => {
-        processedElements = new WeakSet();
-        const allElements = document.querySelectorAll('*');
-        let index = 0;
-        requestIdleCallback(function processNext(deadline) {
-            while (index < allElements.length && (deadline.timeRemaining() > 1 || deadline.didTimeout)) {
-                processElement(allElements[index]);
-                index++;
-            }
-            if (index < allElements.length) {
-                requestIdleCallback(processNext, { timeout: 300 });
-            } else {
-                updateScheduled = false;
-            }
-        }, { timeout: 300 });
-    });
-}
-    /**
-     * 执行完整的 DOM 扫描（用于初始化或手动更新）。
-     */
-function scanAllElements(force) {
-    // 重置处理记录（无论是否暂停都需要重置，保证状态干净）
-    processedElements = new WeakSet();
-
-    // 如果不是强制模式，且暂停了，则返回
-    if (!force && isProcessingPaused) return;
-
-    const allElements = document.querySelectorAll('*');
-    let index = 0;
-    requestIdleCallback(function processNext(deadline) {
-        while (index < allElements.length && (deadline.timeRemaining() > 1 || deadline.didTimeout)) {
-            processElement(allElements[index]);
-            index++;
-        }
-        if (index < allElements.length) {
-            requestIdleCallback(processNext, { timeout: 300 });
-        }
-    }, { timeout: 300 });
-}
-    // ========================================================================
-    // 公开 API
-    // ========================================================================
-
-    /**
-     * 手动渲染指定元素或选择器。
-     * @param {string|Element} selector - CSS 选择器或元素
-     */
-    ftw.render = function(selector) {
-        if (typeof selector === 'string' || selector instanceof Element) {
-            if (selector instanceof Element) {
-                renderStyleNode(selector);
-            } else {
-                // 字符串可以是多个选择器，用逗号或空格分隔？原代码用逗号或空格分割
-                selector.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).forEach(part => {
-                    // 支持 'selector:index' 格式指定第几个
-                    const [sel, idxStr] = part.split(':');
-                    const idx = idxStr ? parseInt(idxStr.trim(), 10) : null;
-                    let elements = [];
-                    if (sel.startsWith('.')) {
-                        const cls = sel.slice(1);
-                        elements = Array.from(document.querySelectorAll('.' + cls));
-                    } else if (sel.startsWith('#')) {
-                        const id = sel.slice(1);
-                        const el = document.getElementById(id);
-                        if (el) elements = [el];
-                    } else {
-                        elements = Array.from(document.querySelectorAll(sel));
-                    }
-                    if (elements.length === 0) {
-                        console.warn('ftw.render: 未找到元素 ', sel);
-                        return;
-                    }
-                    if (idx !== null) {
-                        const targetIdx = idx - 1;
-                        if (targetIdx < 0 || targetIdx >= elements.length) {
-                            console.warn(`ftw.render: 元素 ${sel} 只有 ${elements.length} 个，无法取第 ${idx} 个`);
-                            return;
-                        }
-                        renderStyleNode(elements[targetIdx]);
-                    } else {
-                        elements.forEach(el => renderStyleNode(el));
-                    }
-                });
-            }
-        } else {
-            console.error('ftw.render: 参数类型错误，只支持元素或字符串');
-        }
-    };
-
-    /**
-     * 加载并应用 ftw-utils 配置脚本。
-     * @param {string|Element} input - 脚本元素或 URL/内容
-     */
-    ftw.use = function(input) {
-        if (typeof input === 'string' || input instanceof Element) {
-            if (input instanceof Element) {
-                loadUtils(input);
-            } else {
-                input.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).forEach(part => {
-                    const [sel, idxStr] = part.split(':');
-                    const idx = idxStr ? parseInt(idxStr.trim(), 10) : null;
-                    let elements = [];
-                    if (sel.startsWith('.')) {
-                        const cls = sel.slice(1);
-                        elements = Array.from(document.querySelectorAll('.' + cls));
-                    } else if (sel.startsWith('#')) {
-                        const id = sel.slice(1);
-                        const el = document.getElementById(id);
-                        if (el) elements = [el];
-                    } else {
-                        elements = Array.from(document.querySelectorAll(sel));
-                    }
-                    if (elements.length === 0) {
-                        console.warn('ftw.use: 未找到元素 ', sel);
-                        return;
-                    }
-                    if (idx !== null) {
-                        const targetIdx = idx - 1;
-                        if (targetIdx < 0 || targetIdx >= elements.length) {
-                            console.warn(`ftw.use: 元素 ${sel} 只有 ${elements.length} 个，无法取第 ${idx} 个`);
-                            return;
-                        }
-                        loadUtils(elements[targetIdx]);
-                    } else {
-                        elements.forEach(el => loadUtils(el));
-                    }
-                });
-            }
-        } else {
-            console.error('ftw.use: 参数类型错误，只支持元素或字符串');
-        }
-    };
-
-    /**
-     * 暂停自动 DOM 处理（适用于性能敏感场景）。
-     */
-    ftw.pause = function() {
-        isProcessingPaused = true;
-    };
-
-    /**
-     * 恢复自动 DOM 处理。
-     */
-    ftw.resume = function() {
-        isProcessingPaused = false;
-        scheduleUpdate();
-    };
-
-    /**
-     * 手动触发一次更新（重新处理指定元素）。
-     * @param {string|Element|NodeList|Array} [target] - 可选的目标元素或选择器
-     */
-    ftw.update = function(target) {
-        if (arguments.length === 0) {
-            scanAllElements(false) // 全量更新，受暂停控制
-        }
-        if (typeof target === 'string') {
-            const elements = document.querySelectorAll(target);
-            for (let i = 0; i < elements.length; i++) {
-                processElement(elements[i]);
-            }
-            return;
-        }
-        if (target instanceof Element) {
-            processElement(target);
-            const descendants = target.querySelectorAll('*');
-            for (let i = 0; i < descendants.length; i++) {
-                processElement(descendants[i]);
-            }
-            return;
-        }
-        if (target && typeof target.forEach === 'function') {
-            target.forEach(el => {
-                if (el instanceof Element) {
-                    processElement(el);
-                    const descendants = el.querySelectorAll('*');
-                    for (let i = 0; i < descendants.length; i++) {
-                        processElement(descendants[i]);
-                    }
-                }
-            });
-            return;
-        }
-        console.warn('[ftw] update 参数无效，应为选择器字符串或元素');
-    };
-
-    /**
-     * 执行一次全量更新并暂停自动处理（用于一次性初始化）。
-     */
-    ftw.once = function(target) {
-        ftw.resume();
-        ftw.update(target); // 更新一次然后暂停
-        ftw.pause();
-    };
-/**
- * 为元素添加 `ftw-ignore` 属性，使其及其子树被动态样式系统忽略。
- * 支持传入多个参数，每个参数可以是选择器字符串或 DOM 元素。
- *
- * @param {...(string|Element)} selectors - 要跳过的元素选择器或 DOM 元素
- * @example
- * ftw.ignore('#ad', document.querySelector('.banner'));
- */
-ftw.ignore = function(...selectors) {
-  for (let arg of selectors) {
-    if (typeof arg === 'string') {
-      document.querySelectorAll(arg).forEach(el => el.setAttribute('ftw-ignore', ''));
-    } else if (arg && arg.nodeType === 1) {
-      arg.setAttribute('ftw-ignore', '');
+      })(styleTag.textContent);
+    } else if (styleTag.tagName === "LINK" && styleTag.rel === "stylesheet") {
+      fetch(styleTag.href)
+        .then(res => res.text())
+        .then(css => {
+          const virtualStyle = document.createElement("style");
+          if (isScoped) virtualStyle.setAttribute("ftw-scoped", "");
+          virtualStyle.textContent = css;
+          parseStyleRender(virtualStyle);
+        })
+        .catch(err => console.warn(`ftw: 无法从 ${styleTag.href} 加载 CSS 样式, 错误: ${err}`));
     }
   }
-};
 
-/**
- * 移除元素上的 `ftw-ignore` 属性，使其恢复动态样式监听。
- * 支持传入多个参数，每个参数可以是选择器字符串或 DOM 元素。
- * 移除属性后会立即调用 `ftw.update` 重新扫描这些元素。
- *
- * @param {...(string|Element)} selectors - 要取消跳过的元素选择器或 DOM 元素
- * @example
- * ftw.unignore('.ad-container', document.getElementById('popup'));
- */
-ftw.unignore = function(...selectors) {
-  for (let arg of selectors) {
-    if (typeof arg === 'string') {
-      document.querySelectorAll(arg).forEach(el => {
-        el.removeAttribute('ftw-ignore');
-        ftw.update(el);
+  // ==========================================
+  // 5. 核心 API 实现 (ftw / b)
+  // ==========================================
+
+  /**
+   * ftw 核心绑定函数：为选择器匹配的元素应用原子样式或 CSS 代码段
+   * @param {Element|string} target 目标 DOM 元素或 CSS 选择器
+   * @param {...string} classNamesOrCssRules 类名列表或 CSS 样式段
+   */
+  function ftw(target, ...classNamesOrCssRules) {
+    let classesToApply = [];
+    let rawStyleStatements = [];
+
+    classNamesOrCssRules.forEach(arg => {
+      if (typeof arg === "string") {
+        arg.replace(/!imp(?=\s|;|$|})/g, "!important")
+          .split(/[;\s]+/)
+          .filter(Boolean)
+          .forEach(val => {
+            if (val.includes(":")) {
+              rawStyleStatements.push(val);
+            } else {
+              classesToApply.push(val);
+            }
+          });
+      }
+    });
+
+    // 处理原生 CSS 声明的动态样式块注入
+    if (rawStyleStatements.length) {
+      if (target instanceof Element) {
+        const uniqueIdClass =
+          target.tagName.toLowerCase() +
+          (target.id ? "#" + target.id : "") +
+          (target.className ? "." + target.className.split(/\s+/).join(".") : "");
+
+        document.head.appendChild(
+          Object.assign(document.createElement("style"), {
+            textContent: `${uniqueIdClass}{${rawStyleStatements.join(";")};}`
+          })
+        );
+      } else if (typeof target === "string" && target) {
+        const sanitizedTarget = target.replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, "");
+        if (/: (?!is\(|where\(|not\(|has\()[\w-]|::|\[/.test(sanitizedTarget)) {
+          console.error(`ftw: 复杂选择器 "${target}" 不支持内联 CSS`);
+        } else {
+          document.head.appendChild(
+            Object.assign(document.createElement("style"), {
+              textContent: `${target}{${rawStyleStatements.join(";")};}`
+            })
+          );
+        }
+      }
+    }
+
+    // 处理原子类名的添加和触发样式分析
+    if (target instanceof Element) {
+      const element = target;
+      let finalClasses = [];
+      classesToApply.forEach(arg => {
+        if (typeof arg === "string") {
+          arg.split(/[;\s]+/).forEach(cls => cls && finalClasses.push(cls));
+        }
       });
-    } else if (arg && arg.nodeType === 1) {
-      arg.removeAttribute('ftw-ignore');
-      ftw.update(arg);
-    }
-  }
-};
-    // ========================================================================
-    // 初始化：注入重置样式 + 启动 MutationObserver
-    // ========================================================================
-
-    /**
-     * 注入基础重置样式（.ftw-recovery 等），用于恢复浏览器默认样式。
-     */
-    function injectResetStyles() {
-        const style = document.createElement('style');
-        style.textContent = `
-            .ftw-recovery,
-            .ftw-recovery * {
-                font-family: revert;
-                font-size: revert;
-                line-height: revert;
-                margin: revert;
-            }
-            .ftw-recovery button,
-            .ftw-recovery input,
-            .ftw-recovery select,
-            .ftw-recovery textarea,
-            .ftw-recovery optgroup,
-            .ftw-recovery [type="button"],
-            .ftw-recovery [type="reset"],
-            .ftw-recovery [type="submit"],
-            .ftw-recovery-this:is(button,input,select,textarea,optgroup,[type="button"],[type="reset"],[type="submit"]) {
-                -webkit-appearance: revert;
-                background-color: revert;
-                background-image: revert;
-                border: revert;
-                padding: revert;
-            }
-            .ftw-recovery a,
-            .ftw-recovery-this:is(a) {
-                color: revert;
-                text-decoration: revert;
-            }
-            .ftw-recovery h1,
-            .ftw-recovery h2,
-            .ftw-recovery h3,
-            .ftw-recovery h4,
-            .ftw-recovery h5,
-            .ftw-recovery h6,
-            .ftw-recovery p,
-            .ftw-recovery ol,
-            .ftw-recovery ul,
-            .ftw-recovery pre,
-            .ftw-recovery blockquote,
-            .ftw-recovery figure,
-            .ftw-recovery dl,
-            .ftw-recovery dd,
-            .ftw-recovery-this:is(h1,h2,h3,h4,h5,h6,p,ol,ul,pre,blockquote,figure,dl,dd) {
-                margin: revert;
-            }
-            .ftw-recovery img,
-            .ftw-recovery svg,
-            .ftw-recovery video,
-            .ftw-recovery canvas,
-            .ftw-recovery audio,
-            .ftw-recovery iframe,
-            .ftw-recovery embed,
-            .ftw-recovery object,
-            .ftw-recovery-this:is(img,svg,video,canvas,audio,iframe,embed,object) {
-                display: revert;
-                vertical-align: revert;
-            }
-        `;
-        document.documentElement.prepend(style);
+      finalClasses.forEach(cls => {
+        element.classList.add(cls);
+        processUtilityClass(cls, element);
+      });
+      return;
     }
 
-    /**
-     * 启动 MutationObserver 监听 DOM 变化。
-     */
-    function startObserver() {
-        if (mutationObserver) return;
-        mutationObserver = new MutationObserver(function(mutations) {
-            // 收集新添加的元素
-            const addedNodes = [];
-            mutations.forEach(mutation => {
-                if (mutation.type === 'childList') {
-                    mutation.addedNodes.forEach(node => {
-                        addedNodes.push(node);
-                        // 检查是否有 ftw-utils 脚本
-                        if (node.matches && node.matches('script[ftw-utils]')) {
-                            loadUtils(node);
-                        }
-                        if (node.querySelectorAll) {
-                            node.querySelectorAll('script[ftw-utils]').forEach(script => loadUtils(script));
-                        }
-                        // 检查是否有 ftw-render 样式
-                        if (node.matches && (node.matches('style[ftw-render]') || node.matches('link[ftw-render][rel="stylesheet"]'))) {
-                            renderStyleNode(node);
-                        }
-                        if (node.querySelectorAll) {
-                            node.querySelectorAll('style[ftw-render], link[ftw-render][rel="stylesheet"]').forEach(style => renderStyleNode(style));
-                        }
-                    });
-                } else if (mutation.type === 'attributes' && mutation.attributeName === 'class' && mutation.target.nodeType === 1) {
-                    // class 属性变化，处理该元素
-                    if (!isProcessingPaused) {
-                        processElement(mutation.target);
-                    }
-                }
-            });
+    if (typeof target !== "string" || !target) return;
 
-            // 批量处理新节点中的 class
-            if (addedNodes.length > 0) {
-                addedNodes.forEach(node => {
-                    if (node.nodeType === 1) {
-                        if (node.hasAttribute('class') && !isProcessingPaused) {
-                            processElement(node);
-                        }
-                        if (node.querySelectorAll) {
-                            node.querySelectorAll('[class]').forEach(el => {
-                                if (!isProcessingPaused) processElement(el);
-                            });
-                        }
-                    }
-                });
-                // 批量处理完成后重置
-                if (!isProcessingPaused) {
-                    // 利用 requestAnimationFrame 清空 processedElements 以允许后续处理
-                    if (!updateScheduled) {
-                        updateScheduled = true;
-                        requestAnimationFrame(() => {
-                            processedElements = new WeakSet();
-                            updateScheduled = false;
-                        });
-                    }
-                }
-            }
-        });
-
-        // 监听整个文档
-        mutationObserver.observe(document.documentElement, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class']
-        });
+    // 如果参数中包含花括号 {}，说明是以选择器整体声明的形式传入 (例如: ".box { color: red }")
+    if (classesToApply.length === 0 && target.includes("{")) {
+      const matches = target.match(/^(.+?)\s*\{(.+)\}$/s);
+      if (matches) {
+        const cleanSelector = matches[1].trim();
+        const bodyContent = matches[2].trim();
+        if (bodyContent) {
+          return ftw(cleanSelector, ...bodyContent.split(/[;\s]+/).filter(Boolean));
+        }
+      }
     }
 
-    /**
-     * 初始化：注入重置样式，启动观察器，加载已有的 ftw-utils 和 ftw-render。
-     */
-function init() {
-    injectResetStyles();
-
-    document.querySelectorAll('script[ftw-utils]').forEach(script => loadUtils(script));
-    document.querySelectorAll('style[ftw-render], link[ftw-render][rel="stylesheet"]').forEach(style => renderStyleNode(style));
-
-    // 如果未暂停则执行扫描（force=false），否则跳过
-    if (!isProcessingPaused) {
-        scanAllElements(false);  // 正常模式，受暂停控制
-    }
-
-    startObserver();
-}
-    // 根据页面加载状态执行初始化
-    if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-        setTimeout(init, 0);
+    let flatClassesList = [];
+    classesToApply.forEach(arg => {
+      if (typeof arg === "string") {
+        arg.split(/[;\s]+/).forEach(cls => cls && flatClassesList.push(cls));
+      }
     });
-} else {
-    setTimeout(init, 0);
-}
 
-    // ========================================================================
-    // 暴露全局
-    // ========================================================================
+    document.querySelectorAll(target).forEach(el => {
+      flatClassesList.forEach(cls => {
+        el.classList.add(cls);
+        processUtilityClass(cls, el);
+      });
+    });
+  }
 
-    window.ftw = ftw;
+  // ==========================================
+  // 6. 默认恢复/重置底层样式表注入 (CSS Resets)
+  // ==========================================
+  (function injectRecoveryStyle() {
+    const style = document.createElement("style");
+    style.textContent =
+      ".ftw-recovery,.ftw-recovery *{font-family:revert;font-size:revert;line-height:revert;margin:revert}" +
+      '.ftw-recovery button,.ftw-recovery input,.ftw-recovery select,.ftw-recovery textarea,.ftw-recovery optgroup,.ftw-recovery [type="button"],.ftw-recovery [type="reset"],.ftw-recovery [type="submit"],.ftw-recovery-this:is(button,input,select,textarea,optgroup,[type="button"],[type="reset"],[type="submit"]){-webkit-appearance:revert;background-color:revert;background-image:revert;border:revert;padding:revert}' +
+      ".ftw-recovery a,.ftw-recovery-this:is(a){color:revert;text-decoration:revert}" +
+      ".ftw-recovery h1,.ftw-recovery h2,.ftw-recovery h3,.ftw-recovery h4,.ftw-recovery h5,.ftw-recovery h6,.ftw-recovery p,.ftw-recovery ol,.ftw-recovery ul,.ftw-recovery pre,.ftw-recovery blockquote,.ftw-recovery figure,.ftw-recovery dl,.ftw-recovery dd,.ftw-recovery-this:is(h1,h2,h3,h4,h5,h6,p,ol,ul,pre,blockquote,figure,dl,dd){margin:revert}" +
+      ".ftw-recovery img,.ftw-recovery svg,.ftw-recovery video,.ftw-recovery canvas,.ftw-recovery audio,.ftw-recovery iframe,.ftw-recovery embed,.ftw-recovery object,.ftw-recovery-this:is(img,svg,video,canvas,audio,iframe,embed,object){display:revert;vertical-align:revert}";
+    document.documentElement.prepend(style);
+  })();
+
+  // ==========================================
+  // 7. 闲置与异步执行调度系统 (Scheduler)
+  // ==========================================
+  let isPaused = false;
+  let isIdleCallbackScheduled = false;
+
+  /**
+   * 采用 requestIdleCallback 分片执行 DOM 树节点上 class 样式的增量匹配和处理
+   */
+  function scheduleIdleProcessing() {
+    if (isIdleCallbackScheduled) return;
+    isIdleCallbackScheduled = true;
+
+    requestIdleCallback(() => {
+      processedElements = new WeakSet();
+      const allElements = Array.from(document.querySelectorAll("*"));
+      let index = 0;
+
+      requestIdleCallback(
+        function processChunk(deadline) {
+          while (
+            index < allElements.length &&
+            (deadline.timeRemaining() > 1 || deadline.didTimeout)
+          ) {
+            processElementClasses(allElements[index]);
+            index++;
+          }
+          if (index < allElements.length) {
+            requestIdleCallback(processChunk, { timeout: 300 });
+          } else {
+            isIdleCallbackScheduled = false;
+          }
+        },
+        { timeout: 300 }
+      );
+    });
+  }
+
+  /**
+   * 注册一个新的原子工具类匹配规则
+   * @param {string} classPattern 匹配类名的基础模式（例如 "w:num"）
+   * @param {Function} generatorFn 生成具体 CSS 的计算函数
+   * @param {Array<number|string>} [paramOrder] 参数重排映射表
+   */
+  function registerUtility(classPattern, generatorFn, paramOrder) {
+    const basePrefix = classPattern.split(":")[0];
+    const regexPattern = new RegExp(`^${basePrefix}(?:-([\\w\\.\\/\\(\\)\\[\\]#%,\\-]+))?$`);
+    utilityRules.set(classPattern, {
+      regex: regexPattern,
+      generator: generatorFn,
+      idxOrder: paramOrder || []
+    });
+    utilityPrefixes.add(basePrefix);
+  }
+
+  /**
+   * 触发扫描和渲染
+   * @param {string|Element|Array<Element>|null} [targets]
+   */
+  function scanAndProcessDOM(targets) {
+    // 扫描自定义脚本与样式表配置
+    document.querySelectorAll("script[ftw-utils]").forEach(el => parseScriptUtility(el));
+    document.querySelectorAll('style[ftw-render],link[ftw-render][rel="stylesheet"]').forEach(el => parseStyleRender(el));
+    
+    // 执行样式垃圾回收
+    garbageCollectUnusedStyles();
+
+    if (isPaused) return;
+
+    // 分析需要处理的节点范围
+    let elementsList;
+    if (arguments.length === 0 || targets === undefined) {
+      elementsList = Array.from(document.querySelectorAll("*"));
+    } else if (typeof targets === "string") {
+      elementsList = Array.from(document.querySelectorAll(targets));
+    } else if (targets instanceof Element) {
+      elementsList = [targets];
+    } else if (targets && typeof targets.forEach === "function") {
+      elementsList = Array.from(targets);
+    } else {
+      elementsList = Array.from(document.querySelectorAll("*"));
+    }
+
+    const elementsToProcess = [];
+    const elementsSet = new Set();
+
+    for (let i = 0; i < elementsList.length; i++) {
+      const el = elementsList[i];
+      if (el && el.nodeType === 1) {
+        if (!elementsSet.has(el)) {
+          elementsSet.add(el);
+          elementsToProcess.push(el);
+        }
+        if (el.querySelectorAll) {
+          const children = el.querySelectorAll("*");
+          for (let j = 0; j < children.length; j++) {
+            const child = children[j];
+            if (!elementsSet.has(child)) {
+              elementsSet.add(child);
+              elementsToProcess.push(child);
+            }
+          }
+        }
+      }
+    }
+
+    const totalCount = elementsToProcess.length;
+    let scanIdx = 0;
+
+    // 依然利用 requestIdleCallback 异步分批解析，不卡顿首屏渲染
+    requestIdleCallback(
+      function runScan(deadline) {
+        while (
+          scanIdx < totalCount &&
+          (deadline.timeRemaining() > 1 || deadline.didTimeout)
+        ) {
+          processElementClasses(elementsToProcess[scanIdx]);
+          scanIdx++;
+        }
+        if (scanIdx < totalCount) {
+          requestIdleCallback(runScan, { timeout: 300 });
+        }
+      },
+      { timeout: 300 }
+    );
+  }
+
+  // ==========================================
+  // 8. 扩展 API: ftw.util - 规则高级注册工具
+  // ==========================================
+  ftw.util = function (configOrKey, valueGenerator, numParamsOrder) {
+    const JS_BUILT_INS = new Set([
+      "Math", "Number", "String", "Array", "Object", "Boolean", "Date", "RegExp",
+      "JSON", "Promise", "Symbol", "Map", "Set", "WeakMap", "WeakSet", "isNaN",
+      "isFinite", "parseInt", "parseFloat", "decodeURI", "decodeURIComponent",
+      "encodeURI", "encodeURIComponent", "escape", "unescape", "typeof", "instanceof"
+    ]);
+
+    const SAFE_EXPR_REGEX = /^[a-zA-Z0-9_\.\[\]\'\"\s\(\)\+\-\*\/\%\?\:\,\|\&\!\=\<\>]+$/;
+
+    /**
+     * 动态创建模板编译解析器（将大括号 {x} 解析为 JS 运算表达式）
+     */
+    function compileTemplateExpression(templateStr, utilityName, contextMap, numericIdxs) {
+      let match;
+      const braceRegex = /(?<!\$)\{([^{}]*)\}/g;
+      const placeholderBlocks = [];
+
+      while ((match = braceRegex.exec(templateStr)) !== null) {
+        placeholderBlocks.push({
+          full: match[0],
+          raw: match[1],
+          start: match.index,
+          end: match.index + match[0].length
+        });
+      }
+
+      if (placeholderBlocks.length === 0) {
+        return () => templateStr;
+      }
+
+      const expressionVarsMap = {};
+      let customVarCount = 0;
+      const expressionsMeta = [];
+
+      for (let i = 0; i < placeholderBlocks.length; i++) {
+        const rawExpr = placeholderBlocks[i].raw;
+        const cleanExpr = rawExpr.replace(/\/\*[\s\S]*?\*\//g, "").trim();
+
+        if (!cleanExpr) {
+          expressionsMeta.push({ type: "empty" });
+          continue;
+        }
+
+        if (/^\d+$/.test(cleanExpr)) {
+          expressionsMeta.push({ type: "number", value: Number(cleanExpr) });
+          continue;
+        }
+
+        let assignedVarName = null;
+        let isAssignment = false;
+        let evaluatedSubExpr = null;
+        let equalsIdx = -1;
+        let depth = 0;
+        let inString = false;
+        let stringChar = null;
+
+        for (let idx = 0; idx < cleanExpr.length; idx++) {
+          const char = cleanExpr[idx];
+          if (inString) {
+            if (char === "\\") {
+              idx++;
+              continue;
+            }
+            if (char === stringChar) inString = false;
+          } else if (char === '"' || char === "'") {
+            inString = true;
+            stringChar = char;
+          } else if (char === "(" || char === "[" || char === "{") {
+            depth++;
+          } else if (char === ")" || char === "]" || char === "}") {
+            depth--;
+          } else if (depth === 0 && char === "=") {
+            if (idx > 0 && (cleanExpr[idx - 1] === "!" || cleanExpr[idx - 1] === "=")) continue;
+            if (idx + 1 < cleanExpr.length && cleanExpr[idx + 1] === "=") continue;
+            if (idx > 0 && (cleanExpr[idx - 1] === ">" || cleanExpr[idx - 1] === "<")) continue;
+            equalsIdx = idx;
+            break;
+          }
+        }
+
+        let innerCode = cleanExpr;
+        if (equalsIdx !== -1) {
+          const variablePart = cleanExpr.slice(0, equalsIdx).trim();
+          const expressionPart = cleanExpr.slice(equalsIdx + 1).trim();
+          if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(variablePart)) {
+            assignedVarName = variablePart;
+            evaluatedSubExpr = expressionPart;
+            isAssignment = true;
+            innerCode = expressionPart;
+          }
+        }
+
+        if (!SAFE_EXPR_REGEX.test(innerCode)) {
+          console.warn(`ftw.util: 工具 "${utilityName}" 的表达式包含非法字符: "${rawExpr}"`);
+          expressionsMeta.push({ type: "static", value: "" });
+          continue;
+        }
+
+        let matchedVar;
+        const varIdentifyRegex = /(?<![a-zA-Z0-9_\.])([a-zA-Z_][a-zA-Z0-9_]*)(?![a-zA-Z0-9_])/g;
+        const uniqueVars = [];
+        const seenVars = new Set();
+
+        while ((matchedVar = varIdentifyRegex.exec(innerCode)) !== null) {
+          const varName = matchedVar[1];
+          if (!seenVars.has(varName)) {
+            seenVars.add(varName);
+            uniqueVars.push(varName);
+          }
+        }
+
+        const varReplacementMap = {};
+        for (let k = 0; k < uniqueVars.length; k++) {
+          const currentVar = uniqueVars[k];
+          if (!JS_BUILT_INS.has(currentVar)) {
+            if (contextMap && contextMap[currentVar] !== undefined) {
+              varReplacementMap[currentVar] = "__ctx_" + currentVar;
+            } else if (currentVar !== "props") {
+              if (expressionVarsMap[currentVar] === undefined) {
+                expressionVarsMap[currentVar] = customVarCount++;
+              }
+              varReplacementMap[currentVar] = `__uvars[${expressionVarsMap[currentVar]}]`;
+            } else {
+              varReplacementMap[currentVar] = "__props";
+            }
+          }
+        }
+
+        if (isAssignment && assignedVarName) {
+          if (!varReplacementMap[assignedVarName]) {
+            if (contextMap && contextMap[assignedVarName] !== undefined) {
+              varReplacementMap[assignedVarName] = "__ctx_" + assignedVarName;
+            } else if (assignedVarName === "props") {
+              varReplacementMap[assignedVarName] = "__props";
+            } else {
+              if (expressionVarsMap[assignedVarName] === undefined) {
+                expressionVarsMap[assignedVarName] = customVarCount++;
+              }
+              varReplacementMap[assignedVarName] = `__uvars[${expressionVarsMap[assignedVarName]}]`;
+            }
+          }
+        }
+
+        let replacements = [];
+        varIdentifyRegex.lastIndex = 0;
+        while ((matchedVar = varIdentifyRegex.exec(innerCode)) !== null) {
+          const currentVar = matchedVar[1];
+          if (varReplacementMap[currentVar]) {
+            replacements.push({
+              pos: matchedVar.index,
+              len: currentVar.length,
+              rep: varReplacementMap[currentVar]
+            });
+          }
+        }
+
+        let compiledBody = innerCode;
+        for (let r = replacements.length - 1; r >= 0; r--) {
+          const rInfo = replacements[r];
+          compiledBody = compiledBody.slice(0, rInfo.pos) + rInfo.rep + compiledBody.slice(rInfo.pos + rInfo.len);
+        }
+
+        if (isAssignment && assignedVarName && varReplacementMap[assignedVarName]) {
+          compiledBody = `(${varReplacementMap[assignedVarName]} !== undefined ? ${varReplacementMap[assignedVarName]} : (${compiledBody}))`;
+        }
+
+        expressionsMeta.push({ type: "expr", expr: compiledBody, rawExpr });
+      }
+
+      const rawFragments = [];
+      let lastSlicePos = 0;
+      for (let f = 0; f < placeholderBlocks.length; f++) {
+        rawFragments.push(templateStr.slice(lastSlicePos, placeholderBlocks[f].start));
+        lastSlicePos = placeholderBlocks[f].end;
+      }
+      rawFragments.push(templateStr.slice(lastSlicePos));
+
+      const compiledEvaluators = expressionsMeta.map(item => {
+        if (item.type === "empty") return () => "";
+        if (item.type === "number") return () => String(item.value);
+        if (item.type === "static") return () => item.value;
+
+        const systemParams = [];
+        const systemGlobals = [...JS_BUILT_INS];
+
+        for (let g = 0; g < systemGlobals.length; g++) {
+          const globalObj = systemGlobals[g];
+          if (typeof window !== "undefined" && window[globalObj] !== undefined) {
+            systemParams.push({ name: globalObj, value: window[globalObj] });
+          } else if (typeof global !== "undefined" && global[globalObj] !== undefined) {
+            systemParams.push({ name: globalObj, value: global[globalObj] });
+          } else if (typeof self !== "undefined" && self[globalObj] !== undefined) {
+            systemParams.push({ name: globalObj, value: self[globalObj] });
+          }
+        }
+
+        const paramNames = systemParams.map(item => item.name);
+        const paramValues = systemParams.map(item => item.value);
+
+        return function (ctxData, originalProps) {
+          const currentNames = paramNames.slice();
+          const currentValues = paramValues.slice();
+
+          if (ctxData) {
+            for (const key in ctxData) {
+              if (ctxData.hasOwnProperty(key)) {
+                currentNames.push("__ctx_" + key);
+                currentValues.push(ctxData[key]);
+              }
+            }
+          }
+
+          currentNames.push("__props");
+          currentValues.push(originalProps);
+          currentNames.push("__uvars");
+          currentValues.push(originalProps);
+
+          try {
+            return new Function(...currentNames, `return (${item.expr})`)(...currentValues);
+          } catch (err) {
+            console.warn(
+              `ftw.util: 工具 "${utilityName}" 的表达式编译运行失败: "${item.rawExpr}"`,
+              "错误原因:",
+              err
+            );
+            return "";
+          }
+        };
+      });
+
+      return function (...args) {
+        const props = args;
+        const convertedProps = args.map((arg, idx) => (numericIdxs.includes(idx) ? Number(arg) : arg));
+        const finalCtx = {};
+
+        if (contextMap) {
+          for (const key in contextMap) {
+            if (contextMap.hasOwnProperty(key)) {
+              const mappedIdx = contextMap[key];
+              finalCtx[key] = convertedProps[mappedIdx] !== undefined ? convertedProps[mappedIdx] : undefined;
+            }
+          }
+        }
+
+        let finalCSSResult = rawFragments[0];
+        for (let eIdx = 0; eIdx < compiledEvaluators.length; eIdx++) {
+          finalCSSResult += compiledEvaluators[eIdx](finalCtx, props);
+          finalCSSResult += rawFragments[eIdx + 1];
+        }
+        return finalCSSResult;
+      };
+    }
+
+    /**
+     * 将用户声明的上下文重映射提取为索引配置
+     */
+    function parseContextMapping(rawMapping) {
+      if (!rawMapping) return null;
+      if (Array.isArray(rawMapping)) {
+        const mapping = {};
+        rawMapping.forEach((name, index) => {
+          if (typeof name === "string" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+            mapping[name] = index;
+          }
+        });
+        return mapping;
+      }
+      if (typeof rawMapping === "object" && rawMapping !== null) {
+        const mapping = {};
+        for (const name in rawMapping) {
+          if (!rawMapping.hasOwnProperty(name)) continue;
+          const parsedIdx = Number(name);
+          if (!isNaN(parsedIdx) && typeof rawMapping[name] === "string" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(rawMapping[name])) {
+            mapping[rawMapping[name]] = parsedIdx;
+          }
+        }
+        return mapping;
+      }
+      return null;
+    }
+
+    /**
+     * 将各种定义（字符串模板、自定义函数等）编译转换成标准的可执行函数
+     */
+    function normalizeGenerator(definition, targetName) {
+      if (typeof definition === "function") return definition;
+      if (typeof definition === "string") {
+        if (!/=>|function/.test(definition)) {
+          const compiled = compileTemplateExpression(definition, targetName, null, []);
+          return function (...args) {
+            return compiled.apply(null, args);
+          };
+        }
+        try {
+          return new Function("return " + definition)();
+        } catch (err) {
+          console.warn(`ftw.util: 工具 "${targetName}" 函数字符串形式解析失败`, err);
+          return () => "";
+        }
+      }
+
+      if (Array.isArray(definition)) {
+        const targetValue = definition[0];
+        const secondParam = definition[1];
+        const thirdParam = definition[2];
+
+        let targetNumericIdxs = null;
+        let targetContextMap = null;
+        let targetCompiledTemplate = null;
+        let targetFunc = null;
+
+        if (typeof targetValue === "function") {
+          targetFunc = targetValue;
+          if (Array.isArray(secondParam)) {
+            if (secondParam.every(v => typeof v === "number")) {
+              targetNumericIdxs = secondParam;
+            } else {
+              targetContextMap = parseContextMapping(secondParam);
+            }
+          } else if (typeof secondParam === "object" && secondParam !== null) {
+            targetContextMap = parseContextMapping(secondParam);
+          }
+        } else if (typeof targetValue === "string") {
+          targetCompiledTemplate = targetValue;
+          if (Array.isArray(secondParam)) {
+            if (secondParam.every(v => typeof v === "number")) {
+              targetNumericIdxs = secondParam;
+            } else {
+              targetContextMap = parseContextMapping(secondParam);
+            }
+          } else if (typeof secondParam === "object" && secondParam !== null) {
+            targetContextMap = parseContextMapping(secondParam);
+          }
+
+          if (Array.isArray(thirdParam) && thirdParam.every(v => typeof v === "number")) {
+            targetNumericIdxs = thirdParam;
+          }
+        }
+
+        if (targetCompiledTemplate) {
+          const compiled = compileTemplateExpression(
+            targetCompiledTemplate,
+            targetName,
+            targetContextMap,
+            targetNumericIdxs || []
+          );
+          const wrapper = function (...args) {
+            return compiled.apply(null, args);
+          };
+          wrapper._numIdx = targetNumericIdxs || [];
+          return wrapper;
+        }
+
+        if (targetFunc) {
+          const wrapper = function (...args) {
+            return targetFunc.apply(null, args);
+          };
+          wrapper._numIdx = targetNumericIdxs || [];
+          return wrapper;
+        }
+      }
+
+      return () => String(definition);
+    }
+
+    /**
+     * 辅助解析：将外部传递的参数名数组转换为对应的索引位映射
+     */
+    function mapParamNamesToIndices(paramNames, compiledFunc) {
+      if (!Array.isArray(paramNames)) return [];
+      const funcParams = (function getFunctionParameters(func) {
+        const matches = func.toString().match(/^(?:function\s*\w*\s*)?\(([^)]*)\)|^\(([^)]*)\)\s*=>/);
+        return matches
+          ? (matches[1] || matches[2] || "").split(",").map(p => p.trim()).filter(Boolean)
+          : [];
+      })(compiledFunc);
+
+      return paramNames
+        .map(param => {
+          if (typeof param === "number") return param;
+          if (typeof param === "string") {
+            const index = funcParams.indexOf(param);
+            if (index === -1) {
+              console.warn(`ftw.util: 参数名 "${param}" 无效，已忽略`);
+            }
+            return index;
+          }
+          return -1;
+        })
+        .filter(idx => idx !== -1);
+    }
+
+    // 核心注册入口：
+    if (typeof configOrKey !== "object" || configOrKey === null) {
+      if (typeof configOrKey === "string") {
+        const normalizedGen = normalizeGenerator(valueGenerator, configOrKey);
+        let numericIdxs = normalizedGen._numIdx || [];
+        if (Array.isArray(numParamsOrder) && numParamsOrder.every(v => typeof v === "number")) {
+          numericIdxs = numParamsOrder;
+        }
+        registerUtility(configOrKey, normalizedGen, mapParamNamesToIndices(numericIdxs, normalizedGen));
+        scheduleIdleProcessing();
+      }
+    } else {
+      for (const key in configOrKey) {
+        if (!configOrKey.hasOwnProperty(key)) continue;
+        const normalizedGen = normalizeGenerator(configOrKey[key], key);
+        registerUtility(key, normalizedGen, mapParamNamesToIndices(normalizedGen._numIdx || [], normalizedGen));
+      }
+      scheduleIdleProcessing();
+    }
+  };
+
+  // ==========================================
+  // 9. API 接口扩展 (ftw.render / ftw.use)
+  // ==========================================
+
+  /**
+   * 手动对页面中带有 ftw-scoped 或指定名称的选择器进行 FSS 语法分析并渲染
+   * @param {Element|string} targetElements
+   */
+  ftw.render = function (targetElements) {
+    if (typeof targetElements === "string" || targetElements instanceof Element) {
+      if (targetElements instanceof Element) {
+        parseStyleRender(targetElements);
+      } else {
+        targetElements
+          .split(/[,\s]+/)
+          .map(t => t.trim())
+          .filter(t => t !== "")
+          .forEach(selector => {
+            const parts = selector.split(":");
+            const querySelector = parts[0].trim();
+            const indexValue = parts[1] ? parseInt(parts[1].trim(), 10) : null;
+            let matchedList = [];
+
+            if (querySelector.startsWith(".")) {
+              matchedList = Array.from(document.querySelectorAll("." + querySelector.slice(1)));
+            } else if (querySelector.startsWith("#")) {
+              const el = document.getElementById(querySelector.slice(1));
+              if (el) matchedList = [el];
+            } else {
+              matchedList = Array.from(document.querySelectorAll(querySelector));
+            }
+
+            if (matchedList.length !== 0) {
+              if (indexValue !== null) {
+                const actualIndex = indexValue - 1;
+                if (actualIndex < 0 || actualIndex >= matchedList.length) {
+                  console.warn(`ftw.render: 元素 ${querySelector} 只有 ${matchedList.length} 个，无法取第 ${indexValue} 个`);
+                  return;
+                }
+                parseStyleRender(matchedList[actualIndex]);
+              } else {
+                matchedList.forEach(el => parseStyleRender(el));
+              }
+            } else {
+              console.warn("ftw.render: 未找到元素 ", querySelector);
+            }
+          });
+      }
+    } else {
+      console.error("ftw.render: 参数类型错误，仅支持传入 Element 实例或选择器字符串");
+    }
+  };
+
+  /**
+   * 手动加载并处理指定 Script 元素下的 JSON 配置
+   * @param {Element|string} targetScripts
+   */
+  ftw.use = function (targetScripts) {
+    if (typeof targetScripts === "string" || targetScripts instanceof Element) {
+      if (targetScripts instanceof Element) {
+        parseScriptUtility(targetScripts);
+      } else {
+        targetScripts
+          .split(/[,\s]+/)
+          .map(t => t.trim())
+          .filter(t => t !== "")
+          .forEach(selector => {
+            const parts = selector.split(":");
+            const querySelector = parts[0].trim();
+            const indexValue = parts[1] ? parseInt(parts[1].trim(), 10) : null;
+            let matchedList = [];
+
+            if (querySelector.startsWith(".")) {
+              matchedList = Array.from(document.querySelectorAll("." + querySelector.slice(1)));
+            } else if (querySelector.startsWith("#")) {
+              const el = document.getElementById(querySelector.slice(1));
+              if (el) matchedList = [el];
+            } else {
+              matchedList = Array.from(document.querySelectorAll(querySelector));
+            }
+
+            if (matchedList.length !== 0) {
+              if (indexValue !== null) {
+                const actualIndex = indexValue - 1;
+                if (actualIndex < 0 || actualIndex >= matchedList.length) {
+                  console.warn(`ftw.use: 元素 ${querySelector} 只有 ${matchedList.length} 个，无法取第 ${indexValue} 个`);
+                  return;
+                }
+                parseScriptUtility(matchedList[actualIndex]);
+              } else {
+                matchedList.forEach(el => parseScriptUtility(el));
+              }
+            } else {
+              console.warn("ftw.use: 未找到元素 ", querySelector);
+            }
+          });
+      }
+    } else {
+      console.error("ftw.use: 参数类型错误，仅支持传入 Element 实例或选择器字符串");
+    }
+  };
+
+  // 绑定全局变量
+  window.ftw = ftw;
+
+  // ==========================================
+  // 10. 监听器与初始化生命周期 (Lifecycle)
+  // ==========================================
+  if (!domObserver) {
+    domObserver = new MutationObserver(mutations => {
+      const addedElements = [];
+      mutations.forEach(mutation => {
+        if (mutation.type === "childList") {
+          mutation.addedNodes.forEach(node => {
+            addedElements.push(node);
+            // 自动拦截新加入文档流的 script[ftw-utils]
+            if (node.matches && node.matches("script[ftw-utils]")) {
+              parseScriptUtility(node);
+            }
+            if (node.querySelectorAll) {
+              node.querySelectorAll("script[ftw-utils]").forEach(subScript => parseScriptUtility(subScript));
+            }
+            // 自动拦截新加入文档流的 style[ftw-render] / FSS link
+            if (node.matches && (node.matches("style[ftw-render]") || node.matches('link[ftw-render][rel="stylesheet"]'))) {
+              parseStyleRender(node);
+            }
+            if (node.querySelectorAll) {
+              node.querySelectorAll('style[ftw-render], link[ftw-render][rel="stylesheet"]').forEach(subStyle => {
+                parseStyleRender(subStyle);
+              });
+            }
+          });
+        }
+        // 如果侦测到元素的 class 属性发生改变，立即运行原子分析
+        if (
+          mutation.type === "attributes" &&
+          mutation.attributeName === "class" &&
+          mutation.target.nodeType === 1
+        ) {
+          if (!isPaused) {
+            processElementClasses(mutation.target);
+          }
+        }
+      });
+
+      if (addedElements.length > 0) {
+        addedElements.forEach(node => {
+          if (node.nodeType === 1) {
+            if (node.hasAttribute("class") && !isPaused) {
+              processElementClasses(node);
+            }
+            if (node.querySelectorAll) {
+              node.querySelectorAll("[class]").forEach(child => {
+                if (!isPaused) processElementClasses(child);
+              });
+            }
+          }
+        });
+
+        if (!isRafScheduled) {
+          isRafScheduled = true;
+          requestAnimationFrame(resetProcessedCache);
+        }
+      }
+    });
+  }
+
+  // 启动对整个 HTML 树的 Mutation 观察
+  const rootElement = document.documentElement;
+  domObserver.observe(rootElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class"]
+  });
+
+  // 文档加载就绪时执行首次全盘扫描
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => {
+      setTimeout(scanAndProcessDOM);
+    });
+  } else {
+    setTimeout(scanAndProcessDOM);
+  }
+
+  // 挂载辅助性控制函数到全局 ftw 下
+  isPaused = false;
+
+  ftw.pause = function () {
+    isPaused = true;
+  };
+
+  ftw.resume = function () {
+    isPaused = false;
+    garbageCollectUnusedStyles();
+  };
+
+  ftw.update = scanAndProcessDOM;
+
+  ftw.once = function (element) {
+    ftw.resume();
+    scanAndProcessDOM(element);
+    ftw.pause();
+  };
+
+  ftw.debug = function () {
+    console.table(
+      Array.from(generatedStylesMap.entries()).map(([cls, css]) => ({
+        class: cls,
+        css: css
+      }))
+    );
+  };
+
+  ftw.gc = garbageCollectUnusedStyles;
+
+  ftw.ignore = function (...targets) {
+    for (const target of targets) {
+      if (typeof target === "string") {
+        document.querySelectorAll(target).forEach(el => el.setAttribute("ftw-ignore", ""));
+      } else if (target && target.nodeType === 1) {
+        target.setAttribute("ftw-ignore", "");
+      }
+    }
+  };
+
+  ftw.unignore = function (...targets) {
+    for (const target of targets) {
+      if (typeof target === "string") {
+        document.querySelectorAll(target).forEach(el => {
+          el.removeAttribute("ftw-ignore");
+          scanAndProcessDOM(el);
+        });
+      } else if (target && target.nodeType === 1) {
+        target.removeAttribute("ftw-ignore");
+        scanAndProcessDOM(target);
+      }
+    }
+  };
 })();
