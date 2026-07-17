@@ -197,9 +197,38 @@
     for (const [ruleKey, ruleDef] of utilityRules) {
       const matches = baseClass.match(ruleDef.regex);
       if (!matches) continue;
-
+      
+      // 分割中括号内容
+      function splitSuffix(s) {
+       if (!s) return [];
+       const parts = [];
+       let current = '';
+       let inBracket = false;
+       for (let i = 0; i < s.length; i++) {
+         const ch = s[i];
+         if (ch === '[') {
+            inBracket = true;
+            current += ch;
+         } else if (ch === ']') {
+            inBracket = false;
+            current += ch;
+         } else if (ch === '-' && !inBracket) {
+            parts.push(current);
+            current = '';
+         } else {
+            current += ch;
+         }
+       }
+      if (current) parts.push(current);
+      return parts.map(p => {
+         if (p.startsWith('[') && p.endsWith(']')) {
+             return p.slice(1, -1);
+         }
+         return p;
+       });
+      }
       // 提取横杠分隔的数值或字符串参数
-      const rawParams = matches[1] ? matches[1].split("-") : [];
+      const rawParams = matches[1] ? splitSuffix(matches[1]) : [];
       const orderDef = ruleDef.idxOrder || [];
       const typesList = ruleKey.split(":").slice(1).map(t => (t === "num" ? "num" : "str"));
 
@@ -229,13 +258,15 @@
       // 执行生成器函数产生 CSS 样式值
       let cssDeclaration = ruleDef.generator(...processedParams);
       if (cssDeclaration) {
+        // 全量替换 !imp → !important
+        cssDeclaration = cssDeclaration.replace(/!imp/g, '!important');
         if (isImportant) {
           // 如果带有 '!' 前缀，所有 CSS 规则追加 !important
           cssDeclaration = cssDeclaration
             .split(";")
             .map(part => {
               const trimmed = part.trim();
-              return trimmed ? trimmed + (trimmed.includes("!important") ? "" : " !important") : "";
+              return trimmed ? trimmed + (trimmed.includes("!important") ? "" : "!important") : "";
             })
             .filter(Boolean)
             .join(";");
@@ -749,12 +780,12 @@
   // ==========================================
   ftw.util = function (configOrKey, valueGenerator, numParamsOrder) {
     const JS_BUILT_INS = new Set([
-      "Math", "Number", "String", "Array", "Object", "Boolean", "Date", "RegExp",
-      "JSON", "Promise", "Symbol", "Map", "Set", "WeakMap", "WeakSet", "isNaN",
-      "isFinite", "parseInt", "parseFloat", "decodeURI", "decodeURIComponent",
-      "encodeURI", "encodeURIComponent", "escape", "unescape", "typeof", "instanceof"
+        "Math","Number","String","Array","Object","Boolean","Date","RegExp","JSON",
+        "Promise","Symbol","Map","Set",
+        "isNaN","parseInt","parseFloat",
+        "typeof","instanceof"
     ]);
-
+    
     const SAFE_EXPR_REGEX = /^[a-zA-Z0-9_\.\[\]\'\"\s\(\)\+\-\*\/\%\?\:\,\|\&\!\=\<\>]+$/;
 
     /**
