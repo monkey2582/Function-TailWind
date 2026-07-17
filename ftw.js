@@ -1,5 +1,5 @@
 /**
- * @file ftw.js - 动态原子化 CSS 引擎 (Fast Tailwind Utility)
+ * @file ftw.js - 动态原子化 CSS 引擎 (Function-TailWind)
  * 这是一个运行时动态解析类名并生成、注入样式表的轻量级 CSS-in-JS 工具库包。
  * @version 5.0.0
  */
