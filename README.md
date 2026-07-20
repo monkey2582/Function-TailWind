@@ -2,8 +2,8 @@ ftw - Function-TailWind
 
 原子化 CSS 库
 
-![https://img.shields.io/badge/License-MIT-yellow.svg]()
-![https://img.shields.io/badge/version-5.0.0-blue]()
+![](https://img.shields.io/badge/License-MIT-yellow.svg)
+![](https://img.shields.io/badge/version-5.0.0-blue)
 
 ftw 是一个轻量级、高性能的原子化 CSS 工具库，灵感来自 Tailwind CSS，但更灵活、更精简。它允许你通过注册自定义工具类或使用内置工具，直接在 HTML 元素上应用样式，无需编写传统 CSS 文件。ftw 可搭配 Tailwind 使用，也可完全独立运行。
 
