@@ -349,26 +349,26 @@ HTML：
 
 常见问题
 
-Q：注册工具后不生效？
-A：确认 ftw 已加载，注册代码在 DOM 加载后执行，或调用 ftw.update() 强制刷新。
+**Q：** 注册工具后不生效？  
+- **A：** 确认 ftw 已加载，注册代码在 DOM 加载后执行，或调用 ftw.update() 强制刷新。
 
-Q：如何让工具类支持 !important？
-A：在类名后加 !imp（如 text-red!imp），或在生成器中直接写 !important。
+**Q：** 如何让工具类支持 !important？  
+- **A：** 在类名后加 !imp（如 text-red!imp），或在生成器中直接写 !important。
 
-Q：@ftw-util 中为什么必须用 props[0]？
-A：因为 {0} 是数字字面量，不会替换为参数值；props[0] 才是真正的参数变量。
+**Q：** @ftw-util 中为什么必须用 props[0]？  
+- **A：** 因为 {0} 是数字字面量，不会替换为参数值；props[0] 才是真正的参数变量。
 
-Q：如何提升大型页面性能？
-A：使用 ftw.pause() 在批量操作前暂停自动处理，完成后 resume()。对静态区域使用 ftw.ignore()。
+**Q：** 如何提升大型页面性能？  
+- **A：** 使用 ftw.pause() 在批量操作前暂停自动处理，完成后 resume()。对静态区域使用 ftw.ignore()。
 
-Q：能否动态卸载工具类？
-A：目前不支持直接卸载，但可通过 ftw.gc() 清理未使用的类，并重新注册覆盖。
+**Q：** 能否动态卸载工具类？  
+- **A:** 目前不支持直接卸载，但可通过 ftw.gc() 清理未使用的类，并重新注册覆盖。
 
-Q：如何处理动画工具？
-A：你可以注册一个 @keyframes 就像普通 CSS 那样定义，或者在 FSS 中定义 @ftw-keyframes，然后在元素上直接使用动画名称作为类名（ftw 会自动识别并生成 animation 样式）。
+**Q：** 如何处理动画工具？  
+- **A：** 你可以注册一个 @keyframes 就像普通 CSS 那样定义，或者在 FSS 中定义 @ftw-keyframes，然后在元素上直接使用动画名称作为类名（ftw 会自动识别并生成 animation 样式）。
 
-Q:@ftw-keyframes 和普通 @keyframes 有什么区别？
-A:@ftw-keyframes 相当于一个工具，你可以通过:num，:str加载名字后面定义传参类型，就像使用普通 ftw-util 一样使用大括号语法，并且可以使用动画名称作为类名执行对应的动画效果，而普通 @keyframes 则完全没有这些能力。
+**Q：** @ftw-keyframes 和普通 @keyframes 有什么区别？  
+- **A：** @ftw-keyframes 相当于一个工具，你可以通过:num，:str加载名字后面定义传参类型，就像使用普通 ftw-util 一样使用大括号语法，并且可以使用动画名称作为类名执行对应的动画效果，而普通 @keyframes 则完全没有这些能力。
 
 ---
 
