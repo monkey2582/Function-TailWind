@@ -375,4 +375,4 @@ HTML：
 贡献与许可
 
 · 贡献：欢迎提交 Issue 和 PR，请遵循项目编码规范。
-· 许可：[MIT-LICENSE](LICENSE)。
+· 许可：[MIT](LICENSE)。
