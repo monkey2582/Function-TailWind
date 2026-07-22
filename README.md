@@ -1,4 +1,4 @@
-**FTW - Function-TailWind**
+FTW - Function-TailWind
 
 *原子化 CSS 库*
 
