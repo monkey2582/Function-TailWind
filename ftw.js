@@ -1,7 +1,8 @@
 /**
- * @file ftw.js - 动态原子化 CSS 引擎 (Function-TailWind)
+ * @file _ftw.js - 动态原子化 CSS 引擎 (Function-TailWind)
  * 这是一个运行时动态解析类名并生成、注入样式表的轻量级 CSS-in-JS 工具库包。
- * @version 5.0.0
+ * 支持 @ftw-keyframes 关键帧动画、@media/@supports 查询、@font-face 字体等 @规则。
+ * @version 6.0.0
  */
 
 !(function () {
@@ -30,6 +31,18 @@
   /** @type {boolean} 是否已调度 requestAnimationFrame 重置 processedElements 状态 */
   let isRafScheduled = false;
 
+  /** @type {Set<string>} 已注册的原子类前缀集合 (例如: 'w', 'h', 'bg' 等) */
+  const utilityPrefixes = new Set();
+
+  /** @type {Map<string, string>} 关键帧动画名到已编译 CSS 内容的映射 */
+  const keyframeRegistry = new Map();
+
+  /** @type {Map<string, {types: string[], compiled: Function}>} 关键帧类型定义注册表（名称 -> 类型参数与编译模板） */
+  const keyframeTypeRegistry = new Map();
+
+  /** @type {number} 关键帧样式插入索引计数器，用于保证动画定义顺序 */
+  let keyframeInsertIndex = 0;
+
   // 初始化动态样式表元素
   let styleElement = document.getElementById("ftw-styles");
   if (!styleElement) {
@@ -46,9 +59,6 @@
 
   /** @type {Map<string, {index: number, className: string}>} CSS 规则到索引及对应类名的映射（用于去重复） */
   const cssRegistry = new Map();
-
-  /** @type {Set<string>} 已注册的原子类前缀集合 (例如: 'w', 'h', 'bg' 等) */
-  const utilityPrefixes = new Set();
 
   // ==========================================
   // 2. 样式注入与垃圾回收机制 (CSS Insertion & GC)
@@ -77,8 +87,8 @@
     }
 
     // 转义类名以支持特殊字符 (如带有括号、斜杠、小数点的类名)
-    const escapedClass = window.CSS && CSS.escape 
-      ? CSS.escape(className) 
+    const escapedClass = window.CSS && CSS.escape
+      ? CSS.escape(className)
       : className.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
 
     const ruleText = `.${escapedClass}{${cssDeclarationValue}}`;
@@ -86,6 +96,22 @@
 
     classRegistry.set(className, { index: newIndex, refCount: 1 });
     cssRegistry.set(cssDeclarationValue, { index: newIndex, className });
+  }
+
+  /**
+   * 插入一条 CSS 规则到样式表，支持指定索引位置（用于关键帧等 @规则）
+   * @param {string} ruleText 完整的 CSS 规则文本
+   * @param {boolean} [useKeyframeIndex] 是否使用关键帧专用索引计数器
+   * @returns {number} 插入后的规则索引，失败返回 -1
+   */
+  function insertCSSRule(ruleText, useKeyframeIndex) {
+    try {
+      const insertAtIndex = useKeyframeIndex ? keyframeInsertIndex++ : styleSheet.cssRules.length;
+      return styleSheet.insertRule(ruleText, insertAtIndex);
+    } catch (err) {
+      console.warn("ftw: 无法插入规则:", ruleText.slice(0, 80), err);
+      return -1;
+    }
   }
 
   /**
@@ -135,99 +161,117 @@
   }
 
   // ==========================================
-  // 3. 类名解析与原子样式生成核心 (Parsing & Generation)
+  // 3. 辅助工具函数
   // ==========================================
 
   /**
-   * 处理单个类名，解析并生成其对应的样式规则
-   * @param {string} rawClass 原始类名 (例如 "w-10", "!bg-red-500", "not-util:my-custom-class")
-   * @param {Element} [targetElement] 携带该类名的目标 DOM 元素
-   * @returns {boolean} 是否成功处理该类名
+   * 在给定文本中寻找与指定位置 { 匹配的闭合 } 括号
+   * @param {string} text 源文本
+   * @param {number} openIndex 起始 { 的位置
+   * @returns {string|null} 括号内的内容，失败返回 null
    */
-  function processUtilityClass(rawClass, targetElement) {
-    // 1. 处理不作为原子类解析的特殊跳过前缀 (not-util: / # 开头)
-    const bypassClass = rawClass.startsWith("not-util:")
-      ? rawClass.slice(9)
-      : rawClass.startsWith("#")
-      ? rawClass.slice(1)
-      : null;
-
-    if (bypassClass) {
-      if (targetElement) {
-        targetElement.classList.add(bypassClass);
-        ignoredClasses.add(bypassClass);
+  function findClosingCurlyBrace(text, openIndex) {
+    if (text[openIndex] !== "{") return null;
+    let depth = 1;
+    let negativeLookBehindDepth = 0;
+    let idx = openIndex + 1;
+    for (; idx < text.length && (depth > 0 || negativeLookBehindDepth > 0); ) {
+      const char = text[idx];
+      const prevChar = text[idx - 1];
+      if (char === "{" && prevChar !== "-") {
+        depth++;
+      } else if (char === "{" && prevChar === "-") {
+        negativeLookBehindDepth++;
+      } else if (char === "}" && negativeLookBehindDepth > 0) {
+        negativeLookBehindDepth--;
+      } else if (char === "}" && depth > 0) {
+        depth--;
       }
-      return true;
+      idx++;
+    }
+    return depth === 0 && negativeLookBehindDepth === 0 ? text.slice(openIndex + 1, idx - 1) : null;
+  }
+
+  /**
+   * 分割以横杠分隔的后缀，同时保持中括号 [] 内的完整性
+   * @param {string} s 待分割的字符串
+   * @returns {string[]} 分割后的数组，中括号内容已去除括号
+   */
+  function splitSuffix(s) {
+    if (!s) return [];
+    const parts = [];
+    let current = "";
+    let inBracket = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "[") {
+        inBracket = true;
+        current += ch;
+      } else if (ch === "]") {
+        inBracket = false;
+        current += ch;
+      } else if (ch === "-" && !inBracket) {
+        parts.push(current);
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    if (current) parts.push(current);
+    return parts.map(p => {
+      if (p.startsWith("[") && p.endsWith("]")) {
+        return p.slice(1, -1);
+      }
+      return p;
+    });
+  }
+
+  // ==========================================
+  // 4. CSS 类名解析与值生成 (Class → CSS Resolution)
+  // ==========================================
+
+  /**
+   * 将类名解析为其对应的 CSS 声明值
+   * 优先检查关键帧动画注册表，再检查工具类注册表
+   * @param {string} className 类名
+   * @returns {string|null} CSS 声明字符串，未匹配返回 null
+   */
+  function resolveClassToCSS(className) {
+    // 1. 检查是否为已注册的关键帧动画
+    if (keyframeRegistry.has(className)) {
+      return "animation:" + className + " 1s";
     }
 
-    if (ignoredClasses.has(rawClass)) return true;
+    // 2. 检查关键帧类型定义（支持动态参数）
+    for (const [keyframeName, typeDef] of keyframeTypeRegistry) {
+      const typeRegex = new RegExp(`^${keyframeName}-(\\[[^\\]]+\\]|[^-][\\w\\.\\/\\-]*)$`);
+      const typeMatch = className.match(typeRegex);
+      if (typeMatch) {
+        const suffix = typeMatch[1];
+        const rawParams = splitSuffix(suffix);
 
-    // 2. 匹配对应原子类的正则表达式生成器
-    let matchedRuleKey = null;
-    for (const [key, rule] of utilityRules) {
-      if (rule.regex.test(rawClass)) {
-        matchedRuleKey = key;
-        break;
-      }
-    }
+        // 分割类型参数和动画参数
+        const typeParams = rawParams.slice(0, typeDef.types.length);
+        const animationParams = rawParams.slice(typeDef.types.length);
 
-    // 3. 处理排他类（如果该元素已有同类型规则，则移除旧的引用，替换为新的）
-    if (matchedRuleKey && targetElement && targetElement.classList) {
-      const ruleDef = utilityRules.get(matchedRuleKey);
-      for (const currentClass of Array.from(targetElement.classList)) {
-        if (currentClass !== rawClass && ruleDef.regex.test(currentClass)) {
-          targetElement.classList.remove(currentClass);
-          removeStyleRule(currentClass);
+        const variantKey = keyframeName + "-" + typeParams.join("-");
+
+        // 若该变体尚未编译，则动态生成并注入
+        if (!keyframeRegistry.has(variantKey)) {
+          const compiledCSS = processCSSBlock(typeDef.compiled(typeParams));
+          insertCSSRule("@keyframes " + variantKey + "{" + compiledCSS + "}");
+          keyframeRegistry.set(variantKey, compiledCSS);
         }
+
+        return "animation:" + variantKey + " " + (animationParams.length > 0 ? animationParams.join(" ") : "1s");
       }
     }
 
-    // 4. 解析修饰符（支持 ! 前缀，用于强制转为 !important）
-    let isImportant = false;
-    let baseClass = rawClass;
-    for (const prefix of utilityPrefixes) {
-      if (rawClass === "!" + prefix || rawClass.startsWith("!" + prefix + "-")) {
-        isImportant = true;
-        baseClass = rawClass.slice(1); // 剥离 '!'
-        break;
-      }
-    }
-
-    // 5. 正式提取参数并生成样式
+    // 3. 检查工具类注册表
     for (const [ruleKey, ruleDef] of utilityRules) {
-      const matches = baseClass.match(ruleDef.regex);
+      const matches = className.match(ruleDef.regex);
       if (!matches) continue;
-      
-      // 分割中括号内容
-      function splitSuffix(s) {
-       if (!s) return [];
-       const parts = [];
-       let current = '';
-       let inBracket = false;
-       for (let i = 0; i < s.length; i++) {
-         const ch = s[i];
-         if (ch === '[') {
-            inBracket = true;
-            current += ch;
-         } else if (ch === ']') {
-            inBracket = false;
-            current += ch;
-         } else if (ch === '-' && !inBracket) {
-            parts.push(current);
-            current = '';
-         } else {
-            current += ch;
-         }
-       }
-      if (current) parts.push(current);
-      return parts.map(p => {
-         if (p.startsWith('[') && p.endsWith(']')) {
-             return p.slice(1, -1);
-         }
-         return p;
-       });
-      }
-      // 提取横杠分隔的数值或字符串参数
+
       const rawParams = matches[1] ? splitSuffix(matches[1]) : [];
       const orderDef = ruleDef.idxOrder || [];
       const typesList = ruleKey.split(":").slice(1).map(t => (t === "num" ? "num" : "str"));
@@ -258,36 +302,136 @@
       // 执行生成器函数产生 CSS 样式值
       let cssDeclaration = ruleDef.generator(...processedParams);
       if (cssDeclaration) {
-        // 全量替换 !imp → !important
-        cssDeclaration = cssDeclaration.replace(/!imp/g, '!important');
-        if (isImportant) {
-          // 如果带有 '!' 前缀，所有 CSS 规则追加 !important
-          cssDeclaration = cssDeclaration
-            .split(";")
-            .map(part => {
-              const trimmed = part.trim();
-              return trimmed ? trimmed + (trimmed.includes("!important") ? "" : "!important") : "";
-            })
-            .filter(Boolean)
-            .join(";");
-        }
-        generatedStylesMap.set(rawClass, cssDeclaration);
+        return cssDeclaration.replace(/!imp/g, "!important");
+      }
+      break;
+    }
+
+    return null;
+  }
+
+  /**
+   * 处理 CSS 代码块，将其中引用的工具类名解析为实际的 CSS 声明
+   * @param {string} cssBlock CSS 规则块内容（花括号内的部分）
+   * @returns {string} 解析后的 CSS 规则块
+   */
+  function processCSSBlock(cssBlock) {
+    if (!cssBlock) return "";
+
+    const statements = cssBlock.split(";").filter(Boolean);
+    const result = [];
+
+    for (let stmt of statements) {
+      stmt = stmt.trim();
+      if (!stmt) continue;
+
+      // 如果包含冒号，说明已经是原生 CSS 声明，直接保留
+      if (stmt.includes(":")) {
+        result.push(stmt);
+        continue;
       }
 
-      if (!cssDeclaration) return false;
+      // 否则可能是工具类引用，尝试解析
+      const tokens = stmt.split(/\s+/).filter(Boolean);
+      const resolved = [];
+      for (const token of tokens) {
+        if (token.includes(":")) {
+          // 原生 CSS 声明
+          resolved.push(token);
+          continue;
+        }
+        // 尝试将类名解析为 CSS 声明
+        const cssVal = resolveClassToCSS(token);
+        resolved.push(cssVal ? cssVal.replace(/;+$/g, "") : token);
+      }
+      if (resolved.length > 0) {
+        result.push(resolved.join(";"));
+      }
+    }
 
-      // 如果生成的代码段中带有冒号 ':' 说明是具体的 CSS 属性（如 color:red），插入样式表。
-      // 如果是一串其他类名，说明是别名（Alias），直接应用这些类名并从元素中卸载当前的别名。
-      if (cssDeclaration.includes(":")) {
-        insertStyleRule(rawClass, cssDeclaration);
-      } else if (targetElement) {
-        targetElement.classList.remove(rawClass);
-        cssDeclaration.split(/\s+/).filter(Boolean).forEach(cls => targetElement.classList.add(cls));
+    return result.join(";");
+  }
+
+  /**
+   * 处理单个类名，解析并生成其对应的样式规则
+   * @param {string} rawClass 原始类名 (例如 "w-10", "!bg-red-500", "not-util:my-custom-class")
+   * @param {Element} [targetElement] 携带该类名的目标 DOM 元素
+   * @returns {boolean} 是否成功处理该类名
+   */
+  function processUtilityClass(rawClass, targetElement) {
+    // 1. 处理不作为原子类解析的特殊跳过前缀 (not-util: / # 开头)
+    const bypassClass = rawClass.startsWith("not-util:")
+      ? rawClass.slice(9)
+      : rawClass.startsWith("#")
+      ? rawClass.slice(1)
+      : null;
+
+    if (bypassClass) {
+      if (targetElement) {
+        targetElement.classList.add(bypassClass);
+        ignoredClasses.add(bypassClass);
       }
       return true;
     }
 
-    return false;
+    if (ignoredClasses.has(rawClass)) return true;
+
+    // 2. 匹配对应原子类的正则表达式生成器，处理排他类替换
+    let matchedRuleKey = null;
+    for (const [key, rule] of utilityRules) {
+      if (rule.regex.test(rawClass)) {
+        matchedRuleKey = key;
+        break;
+      }
+    }
+
+    if (matchedRuleKey && targetElement && targetElement.classList) {
+      const ruleDef = utilityRules.get(matchedRuleKey);
+      for (const currentClass of Array.from(targetElement.classList)) {
+        if (currentClass !== rawClass && ruleDef.regex.test(currentClass)) {
+          targetElement.classList.remove(currentClass);
+          removeStyleRule(currentClass);
+        }
+      }
+    }
+
+    // 3. 解析修饰符（支持 ! 前缀，用于强制转为 !important）
+    let isImportant = false;
+    let baseClass = rawClass;
+    for (const prefix of utilityPrefixes) {
+      if (rawClass === "!" + prefix || rawClass.startsWith("!" + prefix + "-")) {
+        isImportant = true;
+        baseClass = rawClass.slice(1); // 剥离 '!'
+        break;
+      }
+    }
+
+    // 4. 使用统一的 CSS 解析函数获取样式声明
+    let cssDeclaration = resolveClassToCSS(baseClass);
+    if (!cssDeclaration) return false;
+
+    // 5. 处理 !important 修饰符
+    if (isImportant) {
+      cssDeclaration = cssDeclaration
+        .split(";")
+        .map(part => {
+          const trimmed = part.trim();
+          return trimmed ? trimmed + (trimmed.includes("!important") ? "" : "!important") : "";
+        })
+        .filter(Boolean)
+        .join(";");
+    }
+
+    generatedStylesMap.set(rawClass, cssDeclaration);
+
+    // 6. 注入样式规则或处理别名
+    if (cssDeclaration.includes(":")) {
+      insertStyleRule(rawClass, cssDeclaration);
+    } else if (targetElement) {
+      targetElement.classList.remove(rawClass);
+      cssDeclaration.split(/\s+/).filter(Boolean).forEach(cls => targetElement.classList.add(cls));
+    }
+    return true;
   }
 
   /**
@@ -300,8 +444,27 @@
     let hasAtomicClass = false;
     for (const className of element.classList) {
       if (!ignoredClasses.has(className)) {
+        // 检查工具类前缀
         for (const prefix of utilityPrefixes) {
           if (className === prefix || className.startsWith(prefix + "-")) {
+            hasAtomicClass = true;
+            break;
+          }
+        }
+        if (hasAtomicClass) break;
+
+        // 检查关键帧动画名称
+        for (const keyframeName of keyframeRegistry.keys()) {
+          if (className === keyframeName || className.startsWith(keyframeName + "-")) {
+            hasAtomicClass = true;
+            break;
+          }
+        }
+        if (hasAtomicClass) break;
+
+        // 检查关键帧类型定义
+        for (const typeName of keyframeTypeRegistry.keys()) {
+          if (className === typeName || className.startsWith(typeName + "-")) {
             hasAtomicClass = true;
             break;
           }
@@ -331,7 +494,537 @@
   }
 
   // ==========================================
-  // 4. JSON / FSS (Style Sheet) 特效配置解析
+  // 4.5. 模板表达式编译引擎 (Template Compiler)
+  // ==========================================
+
+  /** @type {Set<string>} JS 内置对象白名单，用于编译表达式时安全注入 */
+  const JS_BUILT_INS = new Set([
+    "Math", "Number", "String", "Array", "Object", "Boolean", "Date", "RegExp", "JSON",
+    "Promise", "Symbol", "Map", "Set",
+    "isNaN", "parseInt", "parseFloat",
+    "typeof", "instanceof"
+  ]);
+
+  /** @type {RegExp} 安全表达式正则，防止代码注入 */
+  const SAFE_EXPR_REGEX = /^[a-zA-Z0-9_\.\[\]\'\"\s\(\)\+\-\*\/\%\?\:\,\|\&\!\=\<\>]+$/;
+
+  /**
+   * 动态创建模板编译解析器（将大括号 {x} 解析为 JS 运算表达式）
+   * @param {string} templateStr 包含 {x} 占位符的模板字符串
+   * @param {string} [utilityName] 工具类名称（用于错误提示）
+   * @param {Object} [contextMap] 上下文变量映射
+   * @param {number[]} [numericIdxs] 需要转为数字类型的参数索引
+   * @returns {Function} 编译后的执行函数
+   */
+  function compileTemplateExpression(templateStr, utilityName, contextMap, numericIdxs) {
+    let match;
+    const braceRegex = /(?<!\$)\{([^{}]*)\}/g;
+    const placeholderBlocks = [];
+
+    while ((match = braceRegex.exec(templateStr)) !== null) {
+      placeholderBlocks.push({
+        full: match[0],
+        raw: match[1],
+        start: match.index,
+        end: match.index + match[0].length
+      });
+    }
+
+    if (placeholderBlocks.length === 0) {
+      return () => templateStr;
+    }
+
+    const expressionVarsMap = {};
+    let customVarCount = 0;
+    const expressionsMeta = [];
+
+    for (let i = 0; i < placeholderBlocks.length; i++) {
+      const rawExpr = placeholderBlocks[i].raw;
+      const cleanExpr = rawExpr.replace(/\/\*[\s\S]*?\*\//g, "").trim();
+
+      if (!cleanExpr) {
+        expressionsMeta.push({ type: "empty" });
+        continue;
+      }
+
+      if (/^\d+$/.test(cleanExpr)) {
+        expressionsMeta.push({ type: "number", value: Number(cleanExpr) });
+        continue;
+      }
+
+      let assignedVarName = null;
+      let isAssignment = false;
+      let equalsIdx = -1;
+      let depth = 0;
+      let inString = false;
+      let stringChar = null;
+
+      for (let idx = 0; idx < cleanExpr.length; idx++) {
+        const char = cleanExpr[idx];
+        if (inString) {
+          if (char === "\\") { idx++; continue; }
+          if (char === stringChar) inString = false;
+        } else if (char === '"' || char === "'") {
+          inString = true;
+          stringChar = char;
+        } else if (char === "(" || char === "[" || char === "{") {
+          depth++;
+        } else if (char === ")" || char === "]" || char === "}") {
+          depth--;
+        } else if (depth === 0 && char === "=") {
+          if (idx > 0 && (cleanExpr[idx - 1] === "!" || cleanExpr[idx - 1] === "=")) continue;
+          if (idx + 1 < cleanExpr.length && cleanExpr[idx + 1] === "=") continue;
+          if (idx > 0 && (cleanExpr[idx - 1] === ">" || cleanExpr[idx - 1] === "<")) continue;
+          equalsIdx = idx;
+          break;
+        }
+      }
+
+      let innerCode = cleanExpr;
+      if (equalsIdx !== -1) {
+        const variablePart = cleanExpr.slice(0, equalsIdx).trim();
+        const expressionPart = cleanExpr.slice(equalsIdx + 1).trim();
+        if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(variablePart)) {
+          assignedVarName = variablePart;
+          isAssignment = true;
+          innerCode = expressionPart;
+        }
+      }
+
+      if (!SAFE_EXPR_REGEX.test(innerCode)) {
+        console.warn(`ftw: 工具 "${utilityName}" 的表达式包含非法字符: "${rawExpr}"`);
+        expressionsMeta.push({ type: "static", value: "" });
+        continue;
+      }
+
+      let matchedVar;
+      const varIdentifyRegex = /(?<![a-zA-Z0-9_\.])([a-zA-Z_][a-zA-Z0-9_]*)(?![a-zA-Z0-9_])/g;
+      const uniqueVars = [];
+      const seenVars = new Set();
+
+      while ((matchedVar = varIdentifyRegex.exec(innerCode)) !== null) {
+        const varName = matchedVar[1];
+        if (!seenVars.has(varName)) {
+          seenVars.add(varName);
+          uniqueVars.push(varName);
+        }
+      }
+
+      const varReplacementMap = {};
+      for (let k = 0; k < uniqueVars.length; k++) {
+        const currentVar = uniqueVars[k];
+        if (!JS_BUILT_INS.has(currentVar)) {
+          if (contextMap && contextMap[currentVar] !== undefined) {
+            varReplacementMap[currentVar] = "__ctx_" + currentVar;
+          } else if (currentVar !== "props") {
+            if (expressionVarsMap[currentVar] === undefined) {
+              expressionVarsMap[currentVar] = customVarCount++;
+            }
+            varReplacementMap[currentVar] = `__uvars[${expressionVarsMap[currentVar]}]`;
+          } else {
+            varReplacementMap[currentVar] = "__props";
+          }
+        }
+      }
+
+      if (isAssignment && assignedVarName && !varReplacementMap[assignedVarName]) {
+        if (contextMap && contextMap[assignedVarName] !== undefined) {
+          varReplacementMap[assignedVarName] = "__ctx_" + assignedVarName;
+        } else if (assignedVarName === "props") {
+          varReplacementMap[assignedVarName] = "__props";
+        } else {
+          if (expressionVarsMap[assignedVarName] === undefined) {
+            expressionVarsMap[assignedVarName] = customVarCount++;
+          }
+          varReplacementMap[assignedVarName] = `__uvars[${expressionVarsMap[assignedVarName]}]`;
+        }
+      }
+
+      let replacements = [];
+      varIdentifyRegex.lastIndex = 0;
+      while ((matchedVar = varIdentifyRegex.exec(innerCode)) !== null) {
+        const currentVar = matchedVar[1];
+        if (varReplacementMap[currentVar]) {
+          replacements.push({
+            pos: matchedVar.index,
+            len: currentVar.length,
+            rep: varReplacementMap[currentVar]
+          });
+        }
+      }
+
+      let compiledBody = innerCode;
+      for (let r = replacements.length - 1; r >= 0; r--) {
+        const rInfo = replacements[r];
+        compiledBody = compiledBody.slice(0, rInfo.pos) + rInfo.rep + compiledBody.slice(rInfo.pos + rInfo.len);
+      }
+
+      if (isAssignment && assignedVarName && varReplacementMap[assignedVarName]) {
+        compiledBody = `(${varReplacementMap[assignedVarName]} !== undefined ? ${varReplacementMap[assignedVarName]} : (${compiledBody}))`;
+      }
+
+      expressionsMeta.push({ type: "expr", expr: compiledBody, rawExpr: rawExpr });
+    }
+
+    const rawFragments = [];
+    let lastSlicePos = 0;
+    for (let f = 0; f < placeholderBlocks.length; f++) {
+      rawFragments.push(templateStr.slice(lastSlicePos, placeholderBlocks[f].start));
+      lastSlicePos = placeholderBlocks[f].end;
+    }
+    rawFragments.push(templateStr.slice(lastSlicePos));
+
+    const compiledEvaluators = expressionsMeta.map(item => {
+      if (item.type === "empty") return () => "";
+      if (item.type === "number") return () => String(item.value);
+      if (item.type === "static") return () => item.value;
+
+      const systemParams = [];
+      const systemGlobals = [...JS_BUILT_INS];
+
+      for (let g = 0; g < systemGlobals.length; g++) {
+        const globalObj = systemGlobals[g];
+        if (typeof window !== "undefined" && window[globalObj] !== undefined) {
+          systemParams.push({ name: globalObj, value: window[globalObj] });
+        } else if (typeof global !== "undefined" && global[globalObj] !== undefined) {
+          systemParams.push({ name: globalObj, value: global[globalObj] });
+        } else if (typeof self !== "undefined" && self[globalObj] !== undefined) {
+          systemParams.push({ name: globalObj, value: self[globalObj] });
+        }
+      }
+
+      const paramNames = systemParams.map(item => item.name);
+      const paramValues = systemParams.map(item => item.value);
+
+      return function (ctxData, originalProps) {
+        const currentNames = paramNames.slice();
+        const currentValues = paramValues.slice();
+
+        if (ctxData) {
+          for (const key in ctxData) {
+            if (ctxData.hasOwnProperty(key)) {
+              currentNames.push("__ctx_" + key);
+              currentValues.push(ctxData[key]);
+            }
+          }
+        }
+
+        currentNames.push("__props");
+        currentValues.push(originalProps);
+        currentNames.push("__uvars");
+        currentValues.push(originalProps);
+
+        try {
+          return new Function(...currentNames, `return (${item.expr})`)(...currentValues);
+        } catch (err) {
+          console.warn(
+            `ftw: 工具 "${utilityName}" 的表达式编译运行失败: "${item.rawExpr}"`,
+            "错误原因:",
+            err
+          );
+          return "";
+        }
+      };
+    });
+
+    return function (...args) {
+      const props = args;
+      const hasNumericIdxs = numericIdxs && numericIdxs.length > 0;
+      const convertedProps = hasNumericIdxs
+        ? args.map((arg, idx) => (numericIdxs.includes(idx) ? Number(arg) : arg))
+        : args;
+      const finalCtx = {};
+
+      if (contextMap) {
+        for (const key in contextMap) {
+          if (contextMap.hasOwnProperty(key)) {
+            const mappedIdx = contextMap[key];
+            finalCtx[key] = convertedProps[mappedIdx] !== undefined ? convertedProps[mappedIdx] : undefined;
+          }
+        }
+      }
+
+      let finalCSSResult = rawFragments[0];
+      for (let eIdx = 0; eIdx < compiledEvaluators.length; eIdx++) {
+        finalCSSResult += compiledEvaluators[eIdx](finalCtx, props);
+        finalCSSResult += rawFragments[eIdx + 1];
+      }
+      return finalCSSResult;
+    };
+  }
+
+  // ==========================================
+  // 5. @规则解析系统 (@ftw-keyframes, @media, @supports 等)
+  // ==========================================
+
+  /**
+   * 解析 @ftw-keyframes 规则块
+   * 支持两种形式：
+   *   1. @ftw-keyframes name:type1,type2 { ... }  — 带类型参数的关键帧定义
+   *   2. @ftw-keyframes name { ... }               — 纯关键帧定义
+   * @param {string} cssText 完整的 CSS 文本
+   * @param {number} keywordIndex @ftw-keyframes 关键字在文本中的起始位置
+   * @returns {{length: number}|null} 解析结果，包含消耗的字符长度
+   */
+  function parseFTWKeyframes(cssText, keywordIndex) {
+    const remainingText = cssText.slice(keywordIndex + 14); // 跳过 "@ftw-keyframes"
+
+    // 跳过空白符到达名称起始位置
+    let nameStart = 0;
+    while (nameStart < remainingText.length && /\s/.test(remainingText[nameStart])) {
+      nameStart++;
+    }
+    if (nameStart >= remainingText.length) return null;
+
+    // 提取名称（可能包含类型声明 name:type1,type2）
+    let nameEnd = nameStart;
+    while (nameEnd < remainingText.length && remainingText[nameEnd] !== "{" && remainingText[nameEnd] !== ";") {
+      nameEnd++;
+    }
+
+    const fullName = remainingText.slice(nameStart, nameEnd).trim();
+    if (!fullName || remainingText[nameEnd] !== "{") return null;
+
+    // 解析名称和类型参数
+    const colonIndex = fullName.indexOf(":");
+    const keyframeName = colonIndex !== -1 ? fullName.slice(0, colonIndex).trim() : fullName;
+    const typeNames = colonIndex !== -1
+      ? fullName.slice(colonIndex + 1).trim().split(",").map(t => t.trim())
+      : [];
+
+    const contentBlock = findClosingCurlyBrace(remainingText, nameEnd);
+    if (contentBlock === null) return null;
+
+    const totalLength = 14 + nameEnd + contentBlock.length + 2;
+
+    if (typeNames.length > 0) {
+      // 带类型参数的关键帧：保护 CSS {} 块后编译表达式模板
+      // 例如 {opacity:0} 是 CSS 块，{w+5}、{0} 是表达式
+      const cssBlocks = [];
+      const protectedContent = contentBlock.replace(
+        /\{([^{}]*:[^{}]*)\}/g,
+        function (match) {
+          cssBlocks.push(match);
+          return "\x00FTW_CSS_" + (cssBlocks.length - 1) + "\x00";
+        }
+      );
+
+      const compiledExpr = compileTemplateExpression(protectedContent);
+
+      keyframeTypeRegistry.set(keyframeName, {
+        types: typeNames,
+        compiled: function (params) {
+          let output = compiledExpr(params);
+          for (let i = 0; i < cssBlocks.length; i++) {
+            output = output.replace("\x00FTW_CSS_" + i + "\x00", cssBlocks[i]);
+          }
+          return output;
+        }
+      });
+      utilityPrefixes.add(keyframeName);
+      return { length: totalLength };
+    }
+
+    // 纯关键帧定义：解析内部百分比帧并处理工具类引用
+    let compiledCSS = "";
+    let cursor = 0;
+    while (cursor < contentBlock.length) {
+      // 跳过空白
+      while (cursor < contentBlock.length && /\s/.test(contentBlock[cursor])) {
+        cursor++;
+      }
+      if (cursor >= contentBlock.length) break;
+
+      // 提取帧选择器 (如 "0%", "100%", "from", "to")
+      let selectorStart = cursor;
+      while (cursor < contentBlock.length && contentBlock[cursor] !== "{") {
+        cursor++;
+      }
+      const selector = contentBlock.slice(selectorStart, cursor).trim();
+      if (!selector || contentBlock[cursor] !== "{") break;
+
+      const frameContent = findClosingCurlyBrace(contentBlock, cursor);
+      if (frameContent === null) break;
+
+      compiledCSS += selector + "{" + processCSSBlock(frameContent) + "}";
+      cursor = cursor + frameContent.length + 2;
+    }
+
+    insertCSSRule("@keyframes " + keyframeName + "{" + compiledCSS + "}");
+    keyframeRegistry.set(keyframeName, compiledCSS);
+    registerKeyframeAnimationUtility(keyframeName);
+    return { length: totalLength };
+  }
+
+  /**
+   * 为关键帧自动注册对应的动画工具类
+   * @param {string} keyframeName 关键帧名称
+   */
+  function registerKeyframeAnimationUtility(keyframeName) {
+    // 检查是否已存在同名工具类注册
+    for (const [key] of utilityRules) {
+      if (key === keyframeName || key.startsWith(keyframeName + ":")) return;
+    }
+
+    registerUtility(
+      keyframeName,
+      function () {
+        const args = Array.from(arguments).filter(v => v !== undefined && v !== "" && v !== null);
+        return "animation:" + keyframeName + " " + (args.length === 0 ? "1s" : args.join(" ")) + ";";
+      },
+      [0, 1, 2, 3, 4, 5, 6]
+    );
+  }
+
+  /**
+   * 解析 @keyframes、@media、@supports、@font-face 等 @规则
+   * @param {string} cssText 完整的 CSS 文本
+   * @param {number} keywordIndex @规则关键字在文本中的起始位置
+   * @param {string} ruleType @规则类型（如 "@keyframes", "@media" 等）
+   * @param {string} [scopeSelector] 作用域选择器（用于 ftw-scoped）
+   * @returns {{length: number}|null} 解析结果
+   */
+  function parseAtRule(cssText, keywordIndex, ruleType, scopeSelector) {
+    const remainingText = cssText.slice(keywordIndex + ruleType.length);
+    let cursor = 0;
+
+    // 跳过空白符
+    while (cursor < remainingText.length && /\s/.test(remainingText[cursor])) {
+      cursor++;
+    }
+    if (cursor >= remainingText.length) return null;
+
+    // 处理无参数 @规则（如 @font-face { ... } 直接以花括号开始）
+    if (remainingText[cursor] === "{") {
+      const innerBlock = findClosingCurlyBrace(remainingText, cursor);
+      if (innerBlock === null) return null;
+      insertCSSRule(ruleType + "{" + innerBlock + "}");
+      return { length: ruleType.length + cursor + innerBlock.length + 2 };
+    }
+
+    // 提取 @规则参数
+    let paramStart = cursor;
+    while (cursor < remainingText.length && remainingText[cursor] !== "{") {
+      cursor++;
+    }
+    if (cursor >= remainingText.length || remainingText[cursor] !== "{") return null;
+
+    const ruleParams = remainingText.slice(paramStart, cursor).trim();
+    const innerBlock = findClosingCurlyBrace(remainingText, cursor);
+    if (innerBlock === null) return null;
+
+    const totalLength = ruleType.length + cursor + innerBlock.length + 2;
+
+    if (ruleType === "@keyframes") {
+      // 标准 @keyframes 规则
+      insertCSSRule("@keyframes " + ruleParams + "{" + innerBlock + "}");
+      keyframeRegistry.set(ruleParams, innerBlock);
+      registerKeyframeAnimationUtility(ruleParams);
+      return { length: totalLength };
+    }
+
+    if (ruleType === "@media" || ruleType === "@supports") {
+      // 处理嵌套的 CSS 规则，支持 @apply 和工具类引用解析
+      const processedInnerCSS = processNestedCSSRules(innerBlock, scopeSelector || "");
+      insertCSSRule(ruleType + " " + ruleParams + "{" + processedInnerCSS + "}");
+      return { length: totalLength };
+    }
+
+    // @font-face 及其他 @规则
+    insertCSSRule(ruleType + " " + ruleParams + "{" + innerBlock + "}");
+    return { length: totalLength };
+  }
+
+  /**
+   * 解析 @import、@charset、@namespace 等简单 @规则
+   * @param {string} cssText 完整的 CSS 文本
+   * @param {number} keywordIndex @规则关键字起始位置
+   * @param {string} ruleType @规则类型
+   * @returns {{length: number}|null} 解析结果
+   */
+  function parseSimpleAtRule(cssText, keywordIndex, ruleType) {
+    const remainingText = cssText.slice(keywordIndex + ruleType.length);
+    let cursor = 0;
+
+    while (cursor < remainingText.length && /\s/.test(remainingText[cursor])) {
+      cursor++;
+    }
+
+    let semicolonIndex = remainingText.indexOf(";", cursor);
+    if (semicolonIndex === -1) semicolonIndex = remainingText.length;
+
+    let ruleText = ruleType + " " + remainingText.slice(cursor, semicolonIndex + 1).trim();
+    if (!ruleText.endsWith(";")) ruleText += ";";
+
+    insertCSSRule(ruleText, ruleType === "@import" || ruleType === "@charset");
+    return { length: ruleType.length + semicolonIndex + 1 };
+  }
+
+  /**
+   * 处理嵌套的 CSS 规则块（用于 @media/@supports 内部），
+   * 解析 @apply 指令和工具类引用
+   * @param {string} cssText CSS 规则块内容
+   * @param {string} scopeSelector 作用域选择器
+   * @returns {string} 处理后的 CSS 规则块
+   */
+  function processNestedCSSRules(cssText, scopeSelector) {
+    let result = "";
+    const cssRuleRegex = /([^{}]+?)\s*\{\s*([^{}]*?)\s*\}/g;
+    let match;
+
+    const isSimpleSelector = sel => {
+      const cleanSel = sel.replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, "");
+      return !/:(?!is\(|where\(|not\(|has\()[\w-]|::|\[/.test(cleanSel);
+    };
+
+    while ((match = cssRuleRegex.exec(cssText)) !== null) {
+      let selector = match[1].trim();
+      let rulesBody = match[2].trim();
+
+      // 处理 @apply 指令
+      const applyRegex = /(@apply\s+([^;]+);?)/g;
+      let appliedClasses = [];
+      let filteredRulesBody = rulesBody;
+      let applyMatch;
+
+      while ((applyMatch = applyRegex.exec(rulesBody)) !== null) {
+        const rawClasses = applyMatch[1].trim();
+        appliedClasses.push(...rawClasses.split(/\s+/).filter(Boolean));
+        filteredRulesBody = filteredRulesBody.replace(applyMatch[0], "");
+      }
+
+      filteredRulesBody = filteredRulesBody.replace(/;?\s*$/, "").trim();
+
+      // 将 @apply 类名解析为 CSS 声明并合并
+      if (appliedClasses.length > 0 && isSimpleSelector(selector)) {
+        for (const cls of appliedClasses) {
+          const cssVal = resolveClassToCSS(cls);
+          if (cssVal && cssVal.includes(":")) {
+            filteredRulesBody = (filteredRulesBody ? filteredRulesBody + ";" : "") + cssVal.replace(/;+$/g, "");
+          }
+        }
+      }
+
+      // 处理剩余规则中的工具类引用
+      if (filteredRulesBody) {
+        filteredRulesBody = processCSSBlock(filteredRulesBody);
+      }
+
+      // 应用作用域选择器
+      if (scopeSelector && filteredRulesBody) {
+        selector = selector.split(",").map(sel => sel.trim() + scopeSelector).join(",");
+      }
+
+      if (filteredRulesBody) {
+        result += selector + "{" + filteredRulesBody + "}";
+      }
+    }
+
+    return result;
+  }
+
+  // ==========================================
+  // 6. JSON / FSS (Style Sheet) 特效配置解析
   // ==========================================
 
   /**
@@ -372,11 +1065,15 @@
 
   /**
    * 解析含有自定义 @ftw-util 的 CSS 样式标签或外链样式表
+   * 支持 @ftw-keyframes、@keyframes、@media、@supports、@font-face 等 @规则
    * @param {Element} styleTag STYLE 标签或 LINK 样式表标签
    */
   function parseStyleRender(styleTag) {
     /**
      * 辅助解析：递归提取大括号 {} 内的代码块并转换为 ftw.util 工具注册
+     * @param {string} text 源文本
+     * @param {number} keywordIndex @ftw-util 关键字位置
+     * @returns {{length: number}|null} 解析结果
      */
     function extractUtilityBlock(text, keywordIndex) {
       const remainingText = text.slice(keywordIndex + 9);
@@ -438,31 +1135,6 @@
       }
     }
 
-    /**
-     * 辅助解析：寻找闭合的 } 括号并捕获其内容
-     */
-    function findClosingCurlyBrace(text, openIndex) {
-      if (text[openIndex] !== "{") return null;
-      let depth = 1;
-      let negativeLookBehindDepth = 0;
-      let idx = openIndex + 1;
-      for (; idx < text.length && (depth > 0 || negativeLookBehindDepth > 0); ) {
-        const char = text[idx];
-        const prevChar = text[idx - 1];
-        if (char === "{" && prevChar !== "-") {
-          depth++;
-        } else if (char === "{" && prevChar === "-") {
-          negativeLookBehindDepth++;
-        } else if (char === "}" && negativeLookBehindDepth > 0) {
-          negativeLookBehindDepth--;
-        } else if (char === "}" && depth > 0) {
-          depth--;
-        }
-        idx++;
-      }
-      return depth === 0 && negativeLookBehindDepth === 0 ? text.slice(openIndex + 1, idx - 1) : null;
-    }
-
     if (styleTag.dataset.ftwProcessed) return;
     styleTag.dataset.ftwProcessed = "true";
 
@@ -476,7 +1148,7 @@
           .replace(/\/\*[\s\S]*?\*\//g, "")
           .replace(/!imp(?=\s|;|$|})/g, "!important");
 
-        // 处理 @ftw-util 语法结构
+        // 第一步：处理 @ftw-util 语法结构
         let utilKeywordIndex = sanitizedText.indexOf("@ftw-util");
         while (utilKeywordIndex !== -1) {
           const parsedObj = extractUtilityBlock(sanitizedText, utilKeywordIndex);
@@ -485,7 +1157,10 @@
           utilKeywordIndex = sanitizedText.indexOf("@ftw-util");
         }
 
-        // 解析一般的 CSS 选择器匹配和 @apply 别名混入
+        // 第二步：处理 @规则（@ftw-keyframes, @keyframes, @media, @supports, @font-face, @import, @charset, @namespace）
+        sanitizedText = processAtRules(sanitizedText, scopeSelector);
+
+        // 第三步：解析一般的 CSS 选择器匹配和 @apply 别名混入
         let match;
         const cssRuleRegex = /([^{}]+?)\s*\{\s*([^{}]*?)\s*\}/g;
         const isSimpleSelector = sel => {
@@ -534,8 +1209,71 @@
     }
   }
 
+  /**
+   * 处理 CSS 文本中的 @规则（@ftw-keyframes, @keyframes, @media, @supports 等）
+   * 按优先级顺序逐个匹配并移除已处理的 @规则
+   * @param {string} cssText CSS 文本
+   * @param {string} scopeSelector 作用域选择器
+   * @returns {string} 移除 @规则后的剩余 CSS 文本
+   */
+  function processAtRules(cssText, scopeSelector) {
+    const atRuleTypes = [
+      "@ftw-keyframes",
+      "@keyframes",
+      "@media",
+      "@supports",
+      "@font-face",
+      "@import",
+      "@charset",
+      "@namespace"
+    ];
+
+    let sanitized = cssText;
+    let hasChanges = true;
+    let iterations = 100;
+    const processedPositions = new Set();
+
+    while (hasChanges && iterations-- > 0) {
+      hasChanges = false;
+
+      for (const ruleType of atRuleTypes) {
+        let ruleIndex = sanitized.indexOf(ruleType);
+
+        // 跳过已处理的位置
+        while (ruleIndex !== -1 && processedPositions.has(ruleIndex)) {
+          ruleIndex = sanitized.indexOf(ruleType, ruleIndex + 1);
+        }
+
+        if (ruleIndex !== -1) {
+          // 确保 @规则在合法位置（行首或前一个字符是空白/分号/花括号）
+          const precedingChar = ruleIndex > 0 ? sanitized.slice(ruleIndex - 1, ruleIndex) : "";
+          if (ruleIndex === 0 || /[\s;{}]/.test(precedingChar)) {
+            let parsedResult;
+
+            if (ruleType === "@ftw-keyframes") {
+              parsedResult = parseFTWKeyframes(sanitized, ruleIndex);
+            } else if (ruleType === "@import" || ruleType === "@charset" || ruleType === "@namespace") {
+              parsedResult = parseSimpleAtRule(sanitized, ruleIndex, ruleType);
+            } else {
+              parsedResult = parseAtRule(sanitized, ruleIndex, ruleType, scopeSelector);
+            }
+
+            if (parsedResult && parsedResult.length > 0) {
+              sanitized = sanitized.slice(0, ruleIndex) + sanitized.slice(ruleIndex + parsedResult.length);
+              hasChanges = true;
+              break;
+            }
+          }
+          processedPositions.add(ruleIndex);
+        }
+      }
+    }
+
+    return sanitized;
+  }
+
   // ==========================================
-  // 5. 核心 API 实现 (ftw / b)
+  // 7. 核心 API 实现 (ftw)
   // ==========================================
 
   /**
@@ -577,7 +1315,7 @@
         );
       } else if (typeof target === "string" && target) {
         const sanitizedTarget = target.replace(/(["'])(?:(?=(\\?))\2.)*?\1/g, "");
-        if (/: (?!is\(|where\(|not\(|has\()[\w-]|::|\[/.test(sanitizedTarget)) {
+        if (/:(?!is\(|where\(|not\(|has\()[\w-]|::|\[/.test(sanitizedTarget)) {
           console.error(`ftw: 复杂选择器 "${target}" 不支持内联 CSS`);
         } else {
           document.head.appendChild(
@@ -635,7 +1373,7 @@
   }
 
   // ==========================================
-  // 6. 默认恢复/重置底层样式表注入 (CSS Resets)
+  // 8. 默认恢复/重置底层样式表注入 (CSS Resets)
   // ==========================================
   (function injectRecoveryStyle() {
     const style = document.createElement("style");
@@ -649,7 +1387,7 @@
   })();
 
   // ==========================================
-  // 7. 闲置与异步执行调度系统 (Scheduler)
+  // 9. 闲置与异步执行调度系统 (Scheduler)
   // ==========================================
   let isPaused = false;
   let isIdleCallbackScheduled = false;
@@ -705,13 +1443,13 @@
 
   /**
    * 触发扫描和渲染
-   * @param {string|Element|Array<Element>|null} [targets]
+   * @param {string|Element|Array<Element>|null} [targets] 可选的作用域限定
    */
   function scanAndProcessDOM(targets) {
     // 扫描自定义脚本与样式表配置
     document.querySelectorAll("script[ftw-utils]").forEach(el => parseScriptUtility(el));
     document.querySelectorAll('style[ftw-render],link[ftw-render][rel="stylesheet"]').forEach(el => parseStyleRender(el));
-    
+
     // 执行样式垃圾回收
     garbageCollectUnusedStyles();
 
@@ -776,264 +1514,13 @@
   }
 
   // ==========================================
-  // 8. 扩展 API: ftw.util - 规则高级注册工具
+  // 10. 扩展 API: ftw.util - 规则高级注册工具
   // ==========================================
   ftw.util = function (configOrKey, valueGenerator, numParamsOrder) {
-    const JS_BUILT_INS = new Set([
-        "Math","Number","String","Array","Object","Boolean","Date","RegExp","JSON",
-        "Promise","Symbol","Map","Set",
-        "isNaN","parseInt","parseFloat",
-        "typeof","instanceof"
-    ]);
-    
-    const SAFE_EXPR_REGEX = /^[a-zA-Z0-9_\.\[\]\'\"\s\(\)\+\-\*\/\%\?\:\,\|\&\!\=\<\>]+$/;
-
-    /**
-     * 动态创建模板编译解析器（将大括号 {x} 解析为 JS 运算表达式）
-     */
-    function compileTemplateExpression(templateStr, utilityName, contextMap, numericIdxs) {
-      let match;
-      const braceRegex = /(?<!\$)\{([^{}]*)\}/g;
-      const placeholderBlocks = [];
-
-      while ((match = braceRegex.exec(templateStr)) !== null) {
-        placeholderBlocks.push({
-          full: match[0],
-          raw: match[1],
-          start: match.index,
-          end: match.index + match[0].length
-        });
-      }
-
-      if (placeholderBlocks.length === 0) {
-        return () => templateStr;
-      }
-
-      const expressionVarsMap = {};
-      let customVarCount = 0;
-      const expressionsMeta = [];
-
-      for (let i = 0; i < placeholderBlocks.length; i++) {
-        const rawExpr = placeholderBlocks[i].raw;
-        const cleanExpr = rawExpr.replace(/\/\*[\s\S]*?\*\//g, "").trim();
-
-        if (!cleanExpr) {
-          expressionsMeta.push({ type: "empty" });
-          continue;
-        }
-
-        if (/^\d+$/.test(cleanExpr)) {
-          expressionsMeta.push({ type: "number", value: Number(cleanExpr) });
-          continue;
-        }
-
-        let assignedVarName = null;
-        let isAssignment = false;
-        let evaluatedSubExpr = null;
-        let equalsIdx = -1;
-        let depth = 0;
-        let inString = false;
-        let stringChar = null;
-
-        for (let idx = 0; idx < cleanExpr.length; idx++) {
-          const char = cleanExpr[idx];
-          if (inString) {
-            if (char === "\\") {
-              idx++;
-              continue;
-            }
-            if (char === stringChar) inString = false;
-          } else if (char === '"' || char === "'") {
-            inString = true;
-            stringChar = char;
-          } else if (char === "(" || char === "[" || char === "{") {
-            depth++;
-          } else if (char === ")" || char === "]" || char === "}") {
-            depth--;
-          } else if (depth === 0 && char === "=") {
-            if (idx > 0 && (cleanExpr[idx - 1] === "!" || cleanExpr[idx - 1] === "=")) continue;
-            if (idx + 1 < cleanExpr.length && cleanExpr[idx + 1] === "=") continue;
-            if (idx > 0 && (cleanExpr[idx - 1] === ">" || cleanExpr[idx - 1] === "<")) continue;
-            equalsIdx = idx;
-            break;
-          }
-        }
-
-        let innerCode = cleanExpr;
-        if (equalsIdx !== -1) {
-          const variablePart = cleanExpr.slice(0, equalsIdx).trim();
-          const expressionPart = cleanExpr.slice(equalsIdx + 1).trim();
-          if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(variablePart)) {
-            assignedVarName = variablePart;
-            evaluatedSubExpr = expressionPart;
-            isAssignment = true;
-            innerCode = expressionPart;
-          }
-        }
-
-        if (!SAFE_EXPR_REGEX.test(innerCode)) {
-          console.warn(`ftw.util: 工具 "${utilityName}" 的表达式包含非法字符: "${rawExpr}"`);
-          expressionsMeta.push({ type: "static", value: "" });
-          continue;
-        }
-
-        let matchedVar;
-        const varIdentifyRegex = /(?<![a-zA-Z0-9_\.])([a-zA-Z_][a-zA-Z0-9_]*)(?![a-zA-Z0-9_])/g;
-        const uniqueVars = [];
-        const seenVars = new Set();
-
-        while ((matchedVar = varIdentifyRegex.exec(innerCode)) !== null) {
-          const varName = matchedVar[1];
-          if (!seenVars.has(varName)) {
-            seenVars.add(varName);
-            uniqueVars.push(varName);
-          }
-        }
-
-        const varReplacementMap = {};
-        for (let k = 0; k < uniqueVars.length; k++) {
-          const currentVar = uniqueVars[k];
-          if (!JS_BUILT_INS.has(currentVar)) {
-            if (contextMap && contextMap[currentVar] !== undefined) {
-              varReplacementMap[currentVar] = "__ctx_" + currentVar;
-            } else if (currentVar !== "props") {
-              if (expressionVarsMap[currentVar] === undefined) {
-                expressionVarsMap[currentVar] = customVarCount++;
-              }
-              varReplacementMap[currentVar] = `__uvars[${expressionVarsMap[currentVar]}]`;
-            } else {
-              varReplacementMap[currentVar] = "__props";
-            }
-          }
-        }
-
-        if (isAssignment && assignedVarName) {
-          if (!varReplacementMap[assignedVarName]) {
-            if (contextMap && contextMap[assignedVarName] !== undefined) {
-              varReplacementMap[assignedVarName] = "__ctx_" + assignedVarName;
-            } else if (assignedVarName === "props") {
-              varReplacementMap[assignedVarName] = "__props";
-            } else {
-              if (expressionVarsMap[assignedVarName] === undefined) {
-                expressionVarsMap[assignedVarName] = customVarCount++;
-              }
-              varReplacementMap[assignedVarName] = `__uvars[${expressionVarsMap[assignedVarName]}]`;
-            }
-          }
-        }
-
-        let replacements = [];
-        varIdentifyRegex.lastIndex = 0;
-        while ((matchedVar = varIdentifyRegex.exec(innerCode)) !== null) {
-          const currentVar = matchedVar[1];
-          if (varReplacementMap[currentVar]) {
-            replacements.push({
-              pos: matchedVar.index,
-              len: currentVar.length,
-              rep: varReplacementMap[currentVar]
-            });
-          }
-        }
-
-        let compiledBody = innerCode;
-        for (let r = replacements.length - 1; r >= 0; r--) {
-          const rInfo = replacements[r];
-          compiledBody = compiledBody.slice(0, rInfo.pos) + rInfo.rep + compiledBody.slice(rInfo.pos + rInfo.len);
-        }
-
-        if (isAssignment && assignedVarName && varReplacementMap[assignedVarName]) {
-          compiledBody = `(${varReplacementMap[assignedVarName]} !== undefined ? ${varReplacementMap[assignedVarName]} : (${compiledBody}))`;
-        }
-
-        expressionsMeta.push({ type: "expr", expr: compiledBody, rawExpr });
-      }
-
-      const rawFragments = [];
-      let lastSlicePos = 0;
-      for (let f = 0; f < placeholderBlocks.length; f++) {
-        rawFragments.push(templateStr.slice(lastSlicePos, placeholderBlocks[f].start));
-        lastSlicePos = placeholderBlocks[f].end;
-      }
-      rawFragments.push(templateStr.slice(lastSlicePos));
-
-      const compiledEvaluators = expressionsMeta.map(item => {
-        if (item.type === "empty") return () => "";
-        if (item.type === "number") return () => String(item.value);
-        if (item.type === "static") return () => item.value;
-
-        const systemParams = [];
-        const systemGlobals = [...JS_BUILT_INS];
-
-        for (let g = 0; g < systemGlobals.length; g++) {
-          const globalObj = systemGlobals[g];
-          if (typeof window !== "undefined" && window[globalObj] !== undefined) {
-            systemParams.push({ name: globalObj, value: window[globalObj] });
-          } else if (typeof global !== "undefined" && global[globalObj] !== undefined) {
-            systemParams.push({ name: globalObj, value: global[globalObj] });
-          } else if (typeof self !== "undefined" && self[globalObj] !== undefined) {
-            systemParams.push({ name: globalObj, value: self[globalObj] });
-          }
-        }
-
-        const paramNames = systemParams.map(item => item.name);
-        const paramValues = systemParams.map(item => item.value);
-
-        return function (ctxData, originalProps) {
-          const currentNames = paramNames.slice();
-          const currentValues = paramValues.slice();
-
-          if (ctxData) {
-            for (const key in ctxData) {
-              if (ctxData.hasOwnProperty(key)) {
-                currentNames.push("__ctx_" + key);
-                currentValues.push(ctxData[key]);
-              }
-            }
-          }
-
-          currentNames.push("__props");
-          currentValues.push(originalProps);
-          currentNames.push("__uvars");
-          currentValues.push(originalProps);
-
-          try {
-            return new Function(...currentNames, `return (${item.expr})`)(...currentValues);
-          } catch (err) {
-            console.warn(
-              `ftw.util: 工具 "${utilityName}" 的表达式编译运行失败: "${item.rawExpr}"`,
-              "错误原因:",
-              err
-            );
-            return "";
-          }
-        };
-      });
-
-      return function (...args) {
-        const props = args;
-        const convertedProps = args.map((arg, idx) => (numericIdxs.includes(idx) ? Number(arg) : arg));
-        const finalCtx = {};
-
-        if (contextMap) {
-          for (const key in contextMap) {
-            if (contextMap.hasOwnProperty(key)) {
-              const mappedIdx = contextMap[key];
-              finalCtx[key] = convertedProps[mappedIdx] !== undefined ? convertedProps[mappedIdx] : undefined;
-            }
-          }
-        }
-
-        let finalCSSResult = rawFragments[0];
-        for (let eIdx = 0; eIdx < compiledEvaluators.length; eIdx++) {
-          finalCSSResult += compiledEvaluators[eIdx](finalCtx, props);
-          finalCSSResult += rawFragments[eIdx + 1];
-        }
-        return finalCSSResult;
-      };
-    }
-
     /**
      * 将用户声明的上下文重映射提取为索引配置
+     * @param {Array|Object} rawMapping 原始映射
+     * @returns {Object|null} {varName: paramIndex} 映射对象
      */
     function parseContextMapping(rawMapping) {
       if (!rawMapping) return null;
@@ -1062,6 +1549,9 @@
 
     /**
      * 将各种定义（字符串模板、自定义函数等）编译转换成标准的可执行函数
+     * @param {*} definition 定义（函数、字符串模板、数组等）
+     * @param {string} targetName 目标工具类名称
+     * @returns {Function} 标准化后的生成器函数
      */
     function normalizeGenerator(definition, targetName) {
       if (typeof definition === "function") return definition;
@@ -1146,6 +1636,9 @@
 
     /**
      * 辅助解析：将外部传递的参数名数组转换为对应的索引位映射
+     * @param {Array} paramNames 参数名数组
+     * @param {Function} compiledFunc 编译后的函数
+     * @returns {number[]} 索引映射数组
      */
     function mapParamNamesToIndices(paramNames, compiledFunc) {
       if (!Array.isArray(paramNames)) return [];
@@ -1193,112 +1686,30 @@
   };
 
   // ==========================================
-  // 9. API 接口扩展 (ftw.render / ftw.use)
+  // 11. API 接口扩展 (ftw.render / ftw.use)
   // ==========================================
 
   /**
-   * 手动对页面中带有 ftw-scoped 或指定名称的选择器进行 FSS 语法分析并渲染
-   * @param {Element|string} targetElements
+   * 手动触发扫描和渲染（支持限定作用域）
+   * @param {Element|string} [targetElements] 可选的目标元素或选择器
    */
   ftw.render = function (targetElements) {
-    if (typeof targetElements === "string" || targetElements instanceof Element) {
-      if (targetElements instanceof Element) {
-        parseStyleRender(targetElements);
-      } else {
-        targetElements
-          .split(/[,\s]+/)
-          .map(t => t.trim())
-          .filter(t => t !== "")
-          .forEach(selector => {
-            const parts = selector.split(":");
-            const querySelector = parts[0].trim();
-            const indexValue = parts[1] ? parseInt(parts[1].trim(), 10) : null;
-            let matchedList = [];
-
-            if (querySelector.startsWith(".")) {
-              matchedList = Array.from(document.querySelectorAll("." + querySelector.slice(1)));
-            } else if (querySelector.startsWith("#")) {
-              const el = document.getElementById(querySelector.slice(1));
-              if (el) matchedList = [el];
-            } else {
-              matchedList = Array.from(document.querySelectorAll(querySelector));
-            }
-
-            if (matchedList.length !== 0) {
-              if (indexValue !== null) {
-                const actualIndex = indexValue - 1;
-                if (actualIndex < 0 || actualIndex >= matchedList.length) {
-                  console.warn(`ftw.render: 元素 ${querySelector} 只有 ${matchedList.length} 个，无法取第 ${indexValue} 个`);
-                  return;
-                }
-                parseStyleRender(matchedList[actualIndex]);
-              } else {
-                matchedList.forEach(el => parseStyleRender(el));
-              }
-            } else {
-              console.warn("ftw.render: 未找到元素 ", querySelector);
-            }
-          });
-      }
-    } else {
-      console.error("ftw.render: 参数类型错误，仅支持传入 Element 实例或选择器字符串");
-    }
+    scanAndProcessDOM(targetElements);
   };
 
   /**
-   * 手动加载并处理指定 Script 元素下的 JSON 配置
-   * @param {Element|string} targetScripts
+   * 手动加载并处理 JSON 配置，同时触发扫描渲染
+   * @param {Element|string} [targetElements] 可选的目标元素或选择器
    */
-  ftw.use = function (targetScripts) {
-    if (typeof targetScripts === "string" || targetScripts instanceof Element) {
-      if (targetScripts instanceof Element) {
-        parseScriptUtility(targetScripts);
-      } else {
-        targetScripts
-          .split(/[,\s]+/)
-          .map(t => t.trim())
-          .filter(t => t !== "")
-          .forEach(selector => {
-            const parts = selector.split(":");
-            const querySelector = parts[0].trim();
-            const indexValue = parts[1] ? parseInt(parts[1].trim(), 10) : null;
-            let matchedList = [];
-
-            if (querySelector.startsWith(".")) {
-              matchedList = Array.from(document.querySelectorAll("." + querySelector.slice(1)));
-            } else if (querySelector.startsWith("#")) {
-              const el = document.getElementById(querySelector.slice(1));
-              if (el) matchedList = [el];
-            } else {
-              matchedList = Array.from(document.querySelectorAll(querySelector));
-            }
-
-            if (matchedList.length !== 0) {
-              if (indexValue !== null) {
-                const actualIndex = indexValue - 1;
-                if (actualIndex < 0 || actualIndex >= matchedList.length) {
-                  console.warn(`ftw.use: 元素 ${querySelector} 只有 ${matchedList.length} 个，无法取第 ${indexValue} 个`);
-                  return;
-                }
-                parseScriptUtility(matchedList[actualIndex]);
-              } else {
-                matchedList.forEach(el => parseScriptUtility(el));
-              }
-            } else {
-              console.warn("ftw.use: 未找到元素 ", querySelector);
-            }
-          });
-      }
-    } else {
-      console.error("ftw.use: 参数类型错误，仅支持传入 Element 实例或选择器字符串");
-    }
+  ftw.use = function (targetElements) {
+    scanAndProcessDOM(targetElements);
   };
 
   // 绑定全局变量
   window.ftw = ftw;
 
   // ==========================================
-  // 10. 监听器与初始化生命周期 (Lifecycle)
+  // 12. 监听器与初始化生命周期 (Lifecycle)
   // ==========================================
   if (!domObserver) {
     domObserver = new MutationObserver(mutations => {
@@ -1398,12 +1809,12 @@
   };
 
   ftw.debug = function () {
-    console.table(
-      Array.from(generatedStylesMap.entries()).map(([cls, css]) => ({
-        class: cls,
-        css: css
-      }))
-    );
+    let debugMap = Array.from(generatedStylesMap.entries()).map(([cls, css]) => ({
+      class: cls,
+      css: css
+    }));
+    console.table(debugMap);
+    return debugMap;
   };
 
   ftw.gc = garbageCollectUnusedStyles;
