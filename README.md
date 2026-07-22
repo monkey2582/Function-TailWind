@@ -1,9 +1,9 @@
-ftw - Function-TailWind
+**FTW - Function-TailWind**
 
-原子化 CSS 库
+*原子化 CSS 库*
 
-![](https://img.shields.io/badge/License-MIT-yellow.svg)
-![](https://img.shields.io/badge/version-5.0.0-blue)
+![Lincense-MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![version-6.0.0](https://img.shields.io/badge/version-6.0.0-blue)
 
 ftw 是一个轻量级、高性能的原子化 CSS 工具库，灵感来自 Tailwind CSS，也可搭配 Tailwind CSS使用，但更灵活、更精简。它允许你通过注册自定义工具类或使用内置工具，直接在 HTML 元素上应用样式，无需编写传统 CSS 文件。ftw 可搭配 Tailwind 使用，也可完全独立运行。
 
@@ -347,7 +347,7 @@ HTML：
 
 ---
 
-常见问题
+**常见问题**
 
 **Q：** 注册工具后不生效？  
 - **A：** 确认 ftw 已加载，注册代码在 DOM 加载后执行，或调用 ftw.update() 强制刷新。
