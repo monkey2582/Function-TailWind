@@ -5,14 +5,14 @@ ftw - Function-TailWind
 ![](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![](https://img.shields.io/badge/version-5.0.0-blue)
 
-ftw 是一个轻量级、高性能的原子化 CSS 工具库，灵感来自 Tailwind CSS，但更灵活、更精简。它允许你通过注册自定义工具类或使用内置工具，直接在 HTML 元素上应用样式，无需编写传统 CSS 文件。ftw 可搭配 Tailwind 使用，也可完全独立运行。
+ftw 是一个轻量级、高性能的原子化 CSS 工具库，灵感来自 Tailwind CSS，也可搭配 Tailwind CSS使用，但更灵活、更精简。它允许你通过注册自定义工具类或使用内置工具，直接在 HTML 元素上应用样式，无需编写传统 CSS 文件。ftw 可搭配 Tailwind 使用，也可完全独立运行。
 
 ---
 
 特性
 
-· 🪶 极轻 – 核心压缩后 < 5KB，无外部依赖
-· ⚡ 高性能 – 基于 MutationObserver 自动处理 DOM 变化，支持手动暂停/恢复
+· 🪶 极轻 – 核心压缩后 < 10KB，无外部依赖
+· ⚡ 高性能 – 基于 MutatonObserver 自动处理 DOM 变化，支持手动暂停/恢复
 · 🧩 灵活注册 – 通过 JavaScript 或 CSS @ftw-util 自定义工具类，支持参数和逻辑
 · 📦 按需生成 – 仅生成实际使用的样式，垃圾回收未使用类
 · 🛠️ 开发者友好 – 调试输出、忽略元素、手动更新等实用 API
@@ -28,14 +28,6 @@ CDN (推荐)：
 
 ```html
 <script src="https://cdn.jsdelivr.net/gh/monkey2582/Function-TailWind@main/ftw.min.js"></script>
-```
-
-NPM：
-
-```bash
-npm install ftw
-# 或
-yarn add ftw
 ```
 
 ES Module：
@@ -297,6 +289,26 @@ ftw.unignore('.static-content');
 · 类名后加 !imp：text-red!imp
 · 在 @ftw-util 值中使用 !imp
 
+动画（@keyframes）支持
+
+ftw 支持标准 @keyframes 和自定义 @ftw-keyframes，并可通过工具类应用动画。
+
+```css
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@ftw-keyframes bounce:num {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY({props[0]}px); }
+}
+```
+
+然后在元素上使用动画名称作为类名（如 fadeIn）即可应用。
+
+动态注册动画工具：也可以通过 ftw.util 注册返回 animation: name 1s; 的工具。
+
 ---
 
 完整示例
@@ -352,11 +364,15 @@ A：使用 ftw.pause() 在批量操作前暂停自动处理，完成后 resume()
 Q：能否动态卸载工具类？
 A：目前不支持直接卸载，但可通过 ftw.gc() 清理未使用的类，并重新注册覆盖。
 
+Q：如何处理动画工具？
+A：你可以注册一个 @keyframes 就像普通 CSS 那样定义，或者在 FSS 中定义 @ftw-keyframes，然后在元素上直接使用动画名称作为类名（ftw 会自动识别并生成 animation 样式）。
+
+Q:@ftw-keyframes 和普通 @keyframes 有什么区别？
+A:@ftw-keyframes 相当于一个工具，你可以通过:num，:str加载名字后面定义传参类型，就像使用普通 ftw-util 一样使用大括号语法，并且可以使用动画名称作为类名执行对应的动画效果，而普通 @keyframes 则完全没有这些能力。
+
 ---
 
 贡献与许可
 
 · 贡献：欢迎提交 Issue 和 PR，请遵循项目编码规范。
 · 许可：MIT License。
-
----
