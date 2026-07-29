@@ -3,7 +3,7 @@
  * 这是一个运行时动态解析类名并生成、注入样式表的轻量级 CSS-in-JS 工具库包。
  * 支持 @ftw-keyframes 关键帧动画、@media/@supports 查询、@font-face 字体等 @规则。
  * 支持批量 CSS 注入、LRU 缓存、基于引用计数的 GC 调度等性能优化。
- * @version 6.1.0
+ * @version 7.0.0
  */
 
 !(function () {
