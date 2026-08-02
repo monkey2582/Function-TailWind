@@ -288,9 +288,65 @@
    * @param {string} className 类名
    * @returns {string} 基础前缀
    */
-  function getBasePrefix(className) {
-    let dashIndex = className.indexOf("-");
-    return dashIndex === -1 ? className : className.slice(0, dashIndex);
+  /**
+   * 从类名中查找最长匹配的前缀规则集
+   * 例如 "bg-red-10" 会依次尝试 "bg-red-10", "bg-red", "bg" 作为前缀
+   * @param {string} className 类名
+   * @returns {Array|null} 匹配的规则数组，未匹配返回 null
+   */
+  function findMatchingRules(className) {
+    let parts = className.split("-");
+    for (let i = parts.length; i >= 1; i--) {
+      let prefix = parts.slice(0, i).join("-");
+      let rules = utilityPrefixMap.get(prefix);
+      if (rules) return rules;
+    }
+    return null;
+  }
+
+  /**
+   * 根据 classPattern 和类型注解生成匹配正则
+   * - 无类型注解（如 "bg-red"）：匹配 "^bg-red(?:-(...))?$"
+   * - 有类型注解（如 "bg-red:num"）：匹配 "^bg-red-(<num>)(?:-...)*$"
+   *   :num 在正则层面匹配数字（含浮点数、分数、百分数）
+   * @param {string} basePrefix 基础前缀（classPattern 中 : 之前的部分）
+   * @param {string[]} types 类型注解数组
+   * @returns {RegExp} 匹配正则
+   */
+  function buildClassRegex(basePrefix, types) {
+    let strSeg = "[\\w\\.\\/\\(\\)\\[\\]#%,\\-]+";
+    let numSeg = "(?:\\[[^\\]]+\\]|[0-9(][0-9+\\*\\/.()%]*)";
+    let escaped = basePrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    if (types.length === 0) {
+      return new RegExp("^" + escaped + "(?:-(" + strSeg + "))?$");
+    }
+
+    let suffixParts = [];
+    for (let i = 0; i < types.length; i++) {
+      suffixParts.push(types[i] === "num" ? numSeg : strSeg);
+    }
+
+    let suffix = suffixParts.join("-");
+    let rest = "(?:-" + strSeg + ")*";
+
+    return new RegExp("^" + escaped + "-(" + suffix + rest + ")$");
+  }
+
+  /**
+   * 安全计算中括号包裹的算术表达式
+   * 只支持 + - * / ( ) . 及数字，用 Function 执行（比 eval 更安全）
+   * @param {string} expr 表达式字符串
+   * @returns {number} 计算结果，非法或异常时返回 NaN
+   */
+  function safeEval(expr) {
+    var s = expr.replace(/\s/g, "");
+    if (!/^[\d+\-*/().]+$/.test(s)) return NaN;
+    try {
+      return new Function("return (" + s + ")")();
+    } catch (e) {
+      return NaN;
+    }
   }
 
   // ==========================================
@@ -384,9 +440,8 @@
       kfEntry = keyframeEntries.next();
     }
 
-    // 3. 检查工具类注册表（通过 utilityPrefixMap 快速定位前缀匹配的规则）
-    let basePrefix = getBasePrefix(className);
-    let prefixRules = utilityPrefixMap.get(basePrefix);
+    // 3. 检查工具类注册表（通过多级前缀查找，最长前缀优先匹配）
+    let prefixRules = findMatchingRules(className);
 
     if (prefixRules) {
       for (let i = 0; i < prefixRules.length; i++) {
@@ -402,13 +457,21 @@
         if (orderDef.length === 0) {
           processedParams = rawParams.map(function (val, idx) {
             let expectedType = idx < typesList.length ? typesList[idx] : "str";
-            return expectedType === "num" ? Number(val) : val;
+            if (expectedType === "num") {
+              val = safeEval(val);
+              return Number(val);
+            }
+            return val;
           });
         } else {
           processedParams = orderDef.map(function (orderIdx, idx) {
             let rawVal = orderIdx < rawParams.length ? rawParams[orderIdx] : "";
             let expectedType = idx < typesList.length ? typesList[idx] : "str";
-            return expectedType === "num" ? Number(rawVal) : rawVal;
+            if (expectedType === "num") {
+              rawVal = safeEval(rawVal);
+              return Number(rawVal);
+            }
+            return rawVal;
           });
         }
 
@@ -507,8 +570,7 @@
 
     // 2. 匹配对应原子类的正则表达式生成器，处理排他类替换
     let matchedRuleKey = null;
-    let basePrefix = getBasePrefix(rawClass);
-    let prefixRules = utilityPrefixMap.get(basePrefix);
+    let prefixRules = findMatchingRules(rawClass);
 
     if (prefixRules) {
       for (let i = 0; i < prefixRules.length; i++) {
@@ -1717,13 +1779,16 @@
    * @param {Array<number|string>} [paramOrder] 参数重排映射表
    */
   function registerUtility(classPattern, generatorFn, paramOrder) {
-    let basePrefix = classPattern.split(":")[0];
-    let regexPattern = new RegExp("^" + basePrefix + "(?:-([\\w\\.\\/\\(\\)\\[\\]#%,\\-]+))?$");
+    let parts = classPattern.split(":");
+    let basePrefix = parts[0];
+    let types = parts.slice(1);
+    let regexPattern = buildClassRegex(basePrefix, types);
 
     let ruleDef = {
       regex: regexPattern,
       generator: generatorFn,
-      idxOrder: paramOrder || []
+      idxOrder: paramOrder || [],
+      types: types
     };
 
     utilityRules.set(classPattern, ruleDef);
@@ -2116,16 +2181,24 @@
    * V8 优化：使用 for...of 迭代 classCache.keys()，避免 forEach 回调栈帧
    * @param {string} [prefix] 可选的前缀过滤器
    */
-  ftw.clearCache = function (prefix) {
-    if (typeof prefix !== "string" || prefix === "") {
+  ftw.clearCache = function (...args) {
+    if (args.length === 0) {
       classCache.clear();
       templateCache.clear();
       return;
     }
-    // 使用 for...of 直接迭代 Map.keys()，V8 可内联优化，无额外回调栈帧
-    for (let _key of classCache.keys()) {
-      if (_key.indexOf(prefix) === 0) {
-        classCache.delete(_key);
+    for (let i = 0; i < args.length; i++) {
+      let prefix = args[i];
+      if (typeof prefix !== "string" || prefix === "") {
+        classCache.clear();
+        templateCache.clear();
+        return;
+      }
+      // 使用 for...of 直接迭代 Map.keys()，V8 可内联优化，无额外回调栈帧
+      for (let _key of classCache.keys()) {
+        if (_key.indexOf(prefix) === 0) {
+          classCache.delete(_key);
+        }
       }
     }
     templateCache.clear();
@@ -2145,34 +2218,25 @@
     for (let i = 0; i < args.length; i++) {
       let arg = args[i];
       if (typeof arg !== "string" || arg === "") continue;
-      let braceStart = arg.indexOf("{");
-      if (braceStart !== -1) {
-        // 选择器块：提取花括号内内容并递归解析
-        let innerBlock = findClosingCurlyBrace(arg, braceStart);
-        let selector = arg.slice(0, braceStart).trim();
-        let resolvedInner = innerBlock !== null ? ftw.css(innerBlock) : "";
-        results.push(selector + "{" + resolvedInner + "}");
-      } else {
-        // 普通类名或原生 CSS 声明
-        let tokens = arg.split(/[;\s]+/);
-        let tokenResults = [];
-        for (let j = 0; j < tokens.length; j++) {
-          let token = tokens[j];
-          if (!token) continue;
-          if (token.indexOf(":") !== -1 && token.indexOf("not-util:") !== 0) {
-            // 原生 CSS 声明，保留（去除末尾多余分号）
-            tokenResults.push(token.replace(/;+$/g, ""));
-          } else {
-            // 原子类名，调用 resolveClassToCSS 解析
-            let cssVal = resolveClassToCSS(token);
-            if (cssVal) {
-              tokenResults.push(cssVal.replace(/;+$/g, ""));
-            }
+      // 普通类名或原生 CSS 声明
+      let tokens = arg.split(/[;\s]+/);
+      let tokenResults = [];
+      for (let j = 0; j < tokens.length; j++) {
+        let token = tokens[j];
+        if (!token) continue;
+        if (token.indexOf(":") !== -1 && token.indexOf("not-util:") !== 0) {
+          // 原生 CSS 声明，保留（去除末尾多余分号）
+          tokenResults.push(token.replace(/;+$/g, ""));
+        } else {
+          // 原子类名，调用 resolveClassToCSS 解析
+          let cssVal = resolveClassToCSS(token);
+          if (cssVal) {
+            tokenResults.push(cssVal.replace(/;+$/g, ""));
           }
         }
-        if (tokenResults.length > 0) {
-          results.push(tokenResults.join(""));
-        }
+      }
+      if (tokenResults.length > 0) {
+        results.push(tokenResults.join(""));
       }
     }
     let result = results.join("");
@@ -2187,6 +2251,12 @@
    * @returns {Object} 冻结的元数据对象 { matched, ruleKey, params, css, fromCache, refCount }
    */
   let _inspectSingle = function (className) {
+    // 剥离 ! 前缀（重要修饰符，不影响类名匹配）
+    let cleanName = className;
+    if (cleanName.indexOf("!") === 0) {
+      cleanName = cleanName.slice(1);
+    }
+
     let matched = false;
     let ruleKey = null;
     let params = [];
@@ -2195,8 +2265,8 @@
     let refCount = 0;
 
     // 1. 优先检查 classCache
-    if (classCache.has(className)) {
-      css = classCache.get(className);
+    if (classCache.has(cleanName)) {
+      css = classCache.get(cleanName);
       fromCache = true;
     }
 
@@ -2206,7 +2276,7 @@
     while (!utilEntry.done) {
       let candidateKey = utilEntry.value[0];
       let ruleDef = utilEntry.value[1];
-      let matchResult = className.match(ruleDef.regex);
+      let matchResult = cleanName.match(ruleDef.regex);
       if (matchResult) {
         matched = true;
         ruleKey = candidateKey;
@@ -2225,7 +2295,7 @@
       while (!kfEntry.done) {
         let kfName = kfEntry.value[0];
         let typeRegex = new RegExp("^" + kfName + "-(\\[[^\\]]+\\]|[^-][\\w\\.\\/\\-]*)$");
-        let kfMatch = className.match(typeRegex);
+        let kfMatch = cleanName.match(typeRegex);
         if (kfMatch) {
           matched = true;
           ruleKey = kfName;
@@ -2238,27 +2308,37 @@
     }
 
     // 4. 如果仍未匹配，检查关键帧注册表
-    if (!matched && keyframeRegistry.has(className)) {
+    if (!matched && keyframeRegistry.has(cleanName)) {
       matched = true;
-      ruleKey = className;
+      ruleKey = cleanName;
     }
 
     // 5. 获取 CSS 值（如果缓存未命中则调用 resolveClassToCSS 解析并写入缓存）
     if (css === null) {
-      css = resolveClassToCSS(className);
+      css = resolveClassToCSS(cleanName);
     }
 
     // 6. 获取引用计数
-    refCount = classRefCount.has(className) ? classRefCount.get(className) : 0;
+    refCount = classRefCount.has(cleanName) ? classRefCount.get(cleanName) : 0;
 
-    return Object.freeze({
+    // 7. 构建结果：根据返回值类型决定显示 css 还是 class
+    //    含 : 为 CSS 声明 → 显示 css；不含 : 为类名 → 显示 class
+    //    均为 null 时不显示对应字段（不会出现 css:null 或 class:null）
+    let result = {
       matched: matched,
       ruleKey: ruleKey,
       params: params,
-      css: css,
       fromCache: fromCache,
       refCount: refCount
-    });
+    };
+    if (css !== null) {
+      if (css.indexOf(":") !== -1) {
+        result.css = css;
+      } else {
+        result.class = css;
+      }
+    }
+    return Object.freeze(result);
   };
 
   /**
